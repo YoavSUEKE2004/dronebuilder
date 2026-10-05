@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import {
   Plane, Github, Sparkles, Check, ArrowRight, Rocket, ArrowLeft, Box,
@@ -109,6 +109,9 @@ export default function Home() {
       setModalCategory(key);
     }
   }, []);
+
+  const componentsRef = useRef<ComponentWithSpecs[]>([]);
+  componentsRef.current = components;
 
   const handlePartsLoaded = useCallback((parts: ComponentWithSpecs[]) => {
     setComponents((prev) => {

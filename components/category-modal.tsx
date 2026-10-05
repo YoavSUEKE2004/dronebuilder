@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useEffect, useCallback } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   X, Star, ExternalLink, Check, Lock, Search, Loader2,
   Store, Zap, AlertCircle, Filter, XCircle, ArrowRight, Box, ArrowLeft, PackageCheck,
@@ -9,6 +9,7 @@ import {
 import type { ComponentWithSpecs, SelectedParts } from '@/lib/supabase';
 import { isCompatibleWithFrame } from '@/lib/frameCompatibility';
 import { cn } from '@/lib/utils';
+import fallbackPartsData from '@/lib/fallback-parts.json';
 
 type Props = {
   isOpen: boolean;
@@ -48,6 +49,63 @@ type ApiPart = {
   quality_score: number;
   stock_status: string;
 };
+
+type FallbackPart = {
+  id: string;
+  name: string;
+  category: string;
+  brand: string;
+  mpn: string;
+  price: number;
+  store_name: string;
+  product_url: string;
+  image_url: string;
+  dimensions_mm: string;
+  mounting_pattern: string;
+  weight_g: number;
+  shipping_days: number;
+  shipping_cost: number;
+  quality_score: number;
+  specs: Record<string, unknown>;
+};
+
+const FALLBACK_PARTS = fallbackPartsData as FallbackPart[];
+
+function getLocalFallbackParts(category: string, query: string): ComponentWithSpecs[] {
+  const q = query.toLowerCase().trim();
+  return FALLBACK_PARTS.filter((p) => {
+    if (category && p.category !== category) return false;
+    if (!q) return true;
+    return (
+      p.name.toLowerCase().includes(q) ||
+      p.brand.toLowerCase().includes(q) ||
+      p.mpn.toLowerCase().includes(q)
+    );
+  }).map((p) => ({
+    id: p.id,
+    name: p.name,
+    category: p.category,
+    price: p.price,
+    store_name: p.store_name,
+    product_url: p.product_url,
+    image_url: p.image_url || '',
+    dimensions_mm: p.dimensions_mm,
+    mounting_pattern: p.mounting_pattern,
+    weight_g: p.weight_g,
+    shipping_days: p.shipping_days,
+    shipping_cost: p.shipping_cost,
+    quality_score: p.quality_score,
+    created_at: new Date().toISOString(),
+    electrical_specs: {
+      component_id: p.id,
+      max_voltage_s: (p.specs.max_voltage_s as number) ?? null,
+      min_voltage_s: (p.specs.min_voltage_s as number) ?? null,
+      max_current_a: (p.specs.max_current_a as number) ?? null,
+      bec_output_v: (p.specs.bec_output_v as number) ?? null,
+      protocol: String(p.specs.protocol || ''),
+    },
+  }));
+}
 
 const VENDOR_COLORS: Record<string, string> = {
   GetFPV: 'text-cyan-400 bg-cyan-500/10',
@@ -181,13 +239,14 @@ function PartSkeleton() {
   );
 }
 
+const FETCH_TIMEOUT_MS = 5000;
+
 export default function CategoryModal({
   isOpen, onClose, onNext, onShow3D, onSkip, category, categoryLabel, nextCategoryLabel, components, selectedParts, onSelect, frame, onPartsLoaded,
 }: Props) {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilters, setActiveFilters] = useState<Record<string, Set<string>>>({});
 
-  // Live API fetching state
   const [apiParts, setApiParts] = useState<ComponentWithSpecs[]>([]);
   const [loadingParts, setLoadingParts] = useState(false);
   const [hasMore, setHasMore] = useState(false);
@@ -198,21 +257,33 @@ export default function CategoryModal({
   const [dataSource, setDataSource] = useState<string>('');
   const [isCustomSearch, setIsCustomSearch] = useState(false);
 
-  // Seed from parent components initially
+  // Refs to avoid stale closures and dependency churn
+  const apiPartsRef = useRef<ComponentWithSpecs[]>([]);
+  const onPartsLoadedRef = useRef(onPartsLoaded);
+  const categoryRef = useRef(category);
+  const fetchInProgressRef = useRef(false);
+
+  // Keep refs in sync without triggering re-renders
+  apiPartsRef.current = apiParts;
+  onPartsLoadedRef.current = onPartsLoaded;
+  categoryRef.current = category;
+
   const seededComponents = useMemo(
     () => components.filter((c) => c.category === category),
     [components, category]
   );
 
-  // The effective list: API results take priority once fetched, otherwise seeded
   const categoryComponents = useMemo(() => {
-    if (hasFetched && apiParts.length > 0) return apiParts;
-    if (hasFetched) return apiParts; // empty after fetch means nothing found
+    if (hasFetched) return apiParts;
     return seededComponents;
   }, [apiParts, hasFetched, seededComponents]);
 
-  // Fetch parts from /api/parts
+  // Stable fetch function — no dependency on apiParts or onPartsLoaded
   const fetchParts = useCallback(async (q: string, off: number, append: boolean) => {
+    // Prevent concurrent fetches for the same category
+    if (fetchInProgressRef.current) return;
+    fetchInProgressRef.current = true;
+
     if (append) {
       setLoadingMore(true);
     } else {
@@ -221,57 +292,87 @@ export default function CategoryModal({
     setWarning(null);
     setIsCustomSearch(!!q);
 
+    const cat = categoryRef.current;
+
     try {
       const params = new URLSearchParams();
-      if (q) {
-        params.set('q', q);
-      }
-      if (category) {
-        params.set('category', category);
-      }
+      if (q) params.set('q', q);
+      if (cat) params.set('category', cat);
       params.set('limit', '20');
       params.set('offset', String(off));
 
-      const res = await fetch(`/api/parts?${params.toString()}`);
+      // 5-second timeout via AbortController
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+      const res = await fetch(`/api/parts?${params.toString()}`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
       if (!res.ok) {
-        setWarning('Failed to fetch parts. Please try again.');
-        if (!append) setApiParts([]);
-        return;
+        throw new Error(`API returned ${res.status}`);
       }
 
       const data = (await res.json()) as { parts?: ApiPart[]; hasMore?: boolean; warning?: string; source?: string };
       const newParts = (data.parts || []).map(apiPartToComponent);
 
+      let combined: ComponentWithSpecs[];
       if (append) {
-        setApiParts((prev) => {
-          const existingIds = new Set(prev.map((p) => p.id));
-          return [...prev, ...newParts.filter((p) => !existingIds.has(p.id))];
-        });
+        const existing = apiPartsRef.current;
+        const existingIds = new Set(existing.map((p) => p.id));
+        combined = [...existing, ...newParts.filter((p) => !existingIds.has(p.id))];
       } else {
-        setApiParts(newParts);
+        combined = newParts;
       }
 
-      if (onPartsLoaded) {
-        onPartsLoaded(append ? [...apiParts, ...newParts] : newParts);
+      setApiParts(combined);
+
+      if (onPartsLoadedRef.current) {
+        onPartsLoadedRef.current(combined);
       }
 
       setHasMore(data.hasMore ?? false);
       setWarning(data.warning ?? null);
       setDataSource(data.source ?? '');
       setHasFetched(true);
-    } catch {
-      setWarning('Network error. Please try again.');
-      if (!append) setApiParts([]);
+    } catch (err) {
+      // Network error or timeout — inject local fallback parts immediately
+      const fallback = getLocalFallbackParts(cat, q);
+
+      if (fallback.length > 0) {
+        let combined: ComponentWithSpecs[];
+        if (append) {
+          const existing = apiPartsRef.current;
+          const existingIds = new Set(existing.map((p) => p.id));
+          combined = [...existing, ...fallback.filter((p) => !existingIds.has(p.id))];
+        } else {
+          combined = fallback;
+        }
+
+        setApiParts(combined);
+        if (onPartsLoadedRef.current) {
+          onPartsLoadedRef.current(combined);
+        }
+        setWarning('Live data unavailable — showing catalog fallback parts.');
+        setDataSource('fallback');
+      } else {
+        setWarning('Failed to fetch parts. Please try again.');
+        if (!append) setApiParts([]);
+      }
+      setHasMore(false);
       setHasFetched(true);
     } finally {
       setLoadingParts(false);
       setLoadingMore(false);
+      fetchInProgressRef.current = false;
     }
-  }, [category, onPartsLoaded, apiParts]);
+  }, []); // Empty deps — stable forever, reads from refs
 
-  // Initial load when modal opens for a new category
+  // Initial load — ONLY when isOpen or category changes, never when fetchParts identity changes
   useEffect(() => {
     if (!isOpen) return;
+
     setSearchQuery('');
     setActiveFilters({});
     setApiParts([]);
@@ -279,17 +380,17 @@ export default function CategoryModal({
     setHasMore(false);
     setHasFetched(false);
     setWarning(null);
-    // Trigger initial fetch with default query (empty q uses default broad query)
+    setDataSource('');
+    setIsCustomSearch(false);
     fetchParts('', 0, false);
-  }, [isOpen, category, fetchParts]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, category]);
 
-  // Search handler
   const handleSearch = useCallback(() => {
     setOffset(0);
     fetchParts(searchQuery, 0, false);
   }, [searchQuery, fetchParts]);
 
-  // Load more
   const handleLoadMore = useCallback(() => {
     const newOffset = offset + 20;
     setOffset(newOffset);
@@ -655,7 +756,7 @@ export default function CategoryModal({
                   'flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-all border',
                   isSkipped
                     ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
-                    : 'bg-slate-800/60 border-slate-700/50 text-slate-300 hover:bg-slate-800'
+                    : 'bg-slate-800/60 border border-slate-700/50 text-slate-300 hover:bg-slate-800'
                 )}
               >
                 <PackageCheck className="w-4 h-4" />
