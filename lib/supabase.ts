@@ -13,6 +13,7 @@ export type Component = {
   store_name: string;
   product_url: string;
   image_url: string;
+  datasheet_url: string;
   dimensions_mm: string;
   mounting_pattern: string;
   weight_g: number;
