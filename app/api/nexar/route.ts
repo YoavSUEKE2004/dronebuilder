@@ -59,7 +59,7 @@ export async function GET(req: NextRequest) {
 
     const tokenRes = await axios.post(NEXAR_TOKEN_URL, tokenParams.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 10000,
+      timeout: 12000,
     });
 
     const accessToken = tokenRes.data.access_token;
@@ -102,7 +102,7 @@ export async function GET(req: NextRequest) {
           Accept: 'application/json, application/graphql-response+json',
           Authorization: `Bearer ${accessToken}`,
         },
-        timeout: 10000,
+        timeout: 12000,
       }
     );
 

@@ -169,7 +169,8 @@ function PartSkeleton() {
   );
 }
 
-const FETCH_TIMEOUT_MS = 10000;
+const FETCH_TIMEOUT_MS = 15000;
+const ABORT_RETRY_DELAY_MS = 300;
 
 export default function CategoryModal({
   isOpen, onClose, onNext, onShow3D, onSkip, category, categoryLabel, nextCategoryLabel, components, selectedParts, onSelect, frame, onPartsLoaded,
@@ -206,7 +207,7 @@ export default function CategoryModal({
     return seededComponents;
   }, [apiParts, hasFetched, seededComponents]);
 
-  const fetchParts = useCallback(async (q: string, off: number, append: boolean) => {
+  const fetchParts = useCallback(async (q: string, off: number, append: boolean, isRetry = false) => {
     if (fetchInProgressRef.current) return;
     fetchInProgressRef.current = true;
 
@@ -219,7 +220,7 @@ export default function CategoryModal({
 
     const cat = categoryRef.current;
 
-    try {
+    const doFetch = async (): Promise<void> => {
       const params = new URLSearchParams();
       if (q) params.set('q', q);
       if (cat) params.set('category', cat);
@@ -229,63 +230,74 @@ export default function CategoryModal({
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-      const res = await fetch(`/api/nexar?${params.toString()}`, { signal: controller.signal });
-      clearTimeout(timeoutId);
+      try {
+        const res = await fetch(`/api/nexar?${params.toString()}`, { signal: controller.signal });
+        clearTimeout(timeoutId);
 
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({}));
-        throw new Error(errBody.error || `API returned ${res.status}`);
-      }
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error || `API returned ${res.status}`);
+        }
 
-      const data = (await res.json()) as {
-        parts?: ApiPart[];
-        hasMore?: boolean;
-        warning?: string;
-        source?: string;
-        error?: string;
-      };
+        const data = (await res.json()) as {
+          parts?: ApiPart[];
+          hasMore?: boolean;
+          warning?: string;
+          source?: string;
+          error?: string;
+        };
 
-      // If the API returned an explicit error (e.g. missing Nexar keys), show the error banner
-      if (data.error && (!data.parts || data.parts.length === 0)) {
-        // All errors from /api/nexar are Nexar-related — show as config error banner
-        setConfigError(data.error);
+        if (data.error && (!data.parts || data.parts.length === 0)) {
+          setConfigError(data.error);
+          if (!append) setApiParts([]);
+          setHasMore(false);
+          setDataSource(data.source || 'empty');
+          setHasFetched(true);
+          return;
+        }
+
+        const newParts = (data.parts || []).map(apiPartToComponent);
+
+        let combined: ComponentWithSpecs[];
+        if (append) {
+          const existing = apiPartsRef.current;
+          const existingIds = new Set(existing.map((p) => p.id));
+          combined = [...existing, ...newParts.filter((p) => !existingIds.has(p.id))];
+        } else {
+          combined = newParts;
+        }
+
+        setApiParts(combined);
+        if (onPartsLoadedRef.current) onPartsLoadedRef.current(combined);
+
+        setHasMore(data.hasMore ?? false);
+        setWarning(data.warning ?? null);
+        setDataSource(data.source ?? '');
+        setHasFetched(true);
+      } catch (err) {
+        clearTimeout(timeoutId);
+        const isAbort = err instanceof Error && err.name === 'AbortError';
+
+        if (isAbort && !isRetry) {
+          await new Promise((r) => setTimeout(r, ABORT_RETRY_DELAY_MS));
+          return doFetch();
+        }
+
+        if (!isAbort) {
+          const msg = err instanceof Error ? err.message : 'Network error';
+          setConfigError(`Nexar Error: ${msg}`);
+        }
         if (!append) setApiParts([]);
         setHasMore(false);
-        setDataSource(data.source || 'empty');
         setHasFetched(true);
-        return;
       }
+    };
 
-      const newParts = (data.parts || []).map(apiPartToComponent);
+    await doFetch();
 
-      let combined: ComponentWithSpecs[];
-      if (append) {
-        const existing = apiPartsRef.current;
-        const existingIds = new Set(existing.map((p) => p.id));
-        combined = [...existing, ...newParts.filter((p) => !existingIds.has(p.id))];
-      } else {
-        combined = newParts;
-      }
-
-      setApiParts(combined);
-      if (onPartsLoadedRef.current) onPartsLoadedRef.current(combined);
-
-      setHasMore(data.hasMore ?? false);
-      setWarning(data.warning ?? null);
-      setDataSource(data.source ?? '');
-      setHasFetched(true);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Network error';
-      // Show all fetch errors as Nexar errors
-      setConfigError(`Nexar Error: [CORS / Network Error] ${msg}`);
-      if (!append) setApiParts([]);
-      setHasMore(false);
-      setHasFetched(true);
-    } finally {
-      setLoadingParts(false);
-      setLoadingMore(false);
-      fetchInProgressRef.current = false;
-    }
+    setLoadingParts(false);
+    setLoadingMore(false);
+    fetchInProgressRef.current = false;
   }, []);
 
   useEffect(() => {
@@ -304,10 +316,20 @@ export default function CategoryModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, category]);
 
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const handleSearch = useCallback(() => {
     setOffset(0);
     fetchParts(searchQuery, 0, false);
   }, [searchQuery, fetchParts]);
+
+  const debouncedSearch = useCallback((q: string) => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      setOffset(0);
+      fetchParts(q, 0, false);
+    }, 500);
+  }, [fetchParts]);
 
   const handleLoadMore = useCallback(() => {
     const newOffset = offset + 20;
@@ -403,8 +425,14 @@ export default function CategoryModal({
                 <input
                   type="text"
                   value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value);
+                    debouncedSearch(e.target.value);
+                  }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') {
+                    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+                    handleSearch();
+                  } }}
                   placeholder={`Search ${categoryLabel.toLowerCase()}...`}
                   className="w-full pl-10 pr-3 py-2 rounded-lg bg-slate-800/60 border border-slate-700/50 text-sm text-slate-200 focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/30 transition-colors"
                 />
