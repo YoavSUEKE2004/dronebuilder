@@ -93,7 +93,7 @@ type NexarSeller = {
   company: { name: string } | null;
   offers: Array<{
     clickUrl: string | null;
-    inventory: number | null;
+    inventoryLevel: number | null;
     prices: Array<{ price: number; currency: string; quantity: number }> | null;
   }> | null;
 };
@@ -258,7 +258,7 @@ async function fetchNexarParts(
               company { name }
               offers {
                 clickUrl
-                inventory
+                inventoryLevel
                 prices { price currency quantity }
               }
             }
@@ -305,7 +305,7 @@ async function fetchNexarParts(
       (s.offers || []).map((offer) => ({
         seller: s.company?.name || '',
         url: offer.clickUrl || '',
-        inStock: offer.inventory ?? null,
+        inStock: offer.inventoryLevel ?? null,
         price: offer.prices?.[0]?.price ?? null,
         currency: offer.prices?.[0]?.currency || 'USD',
       }))

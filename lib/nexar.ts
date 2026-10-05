@@ -96,8 +96,8 @@ export async function searchNexarParts(
                     company { name }
                     offers {
                       clickUrl
-                      inventory
-                      prices { price currency }
+                      inventoryLevel
+                      prices { price currency quantity }
                     }
                   }
                 }
@@ -135,8 +135,8 @@ export async function searchNexarParts(
                 company: { name: string } | null;
                 offers: Array<{
                   clickUrl: string | null;
-                  inventory: number | null;
-                  prices: Array<{ price: number; currency: string }> | null;
+                  inventoryLevel: number | null;
+                  prices: Array<{ price: number; currency: string; quantity: number }> | null;
                 }> | null;
               }> | null;
             };
@@ -176,7 +176,7 @@ export async function searchNexarParts(
         (s.offers || []).map((offer) => ({
           seller: s.company?.name || '',
           url: offer.clickUrl || '',
-          inStock: offer.inventory ?? null,
+          inStock: offer.inventoryLevel ?? null,
           price: offer.prices?.[0]?.price ?? null,
           currency: offer.prices?.[0]?.currency || 'USD',
         }))
