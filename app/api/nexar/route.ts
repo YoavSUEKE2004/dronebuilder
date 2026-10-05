@@ -86,41 +86,70 @@ async function getNexarToken(): Promise<string> {
   const clientId = process.env.NEXAR_CLIENT_ID;
   const clientSecret = process.env.NEXAR_CLIENT_SECRET;
 
+  console.log('[Nexar Proxy] ID present:', !!clientId);
+  console.log('[Nexar Proxy] Secret present:', !!clientSecret);
+
   if (!clientId || !clientSecret) {
-    throw new Error('NEXAR_CLIENT_ID or NEXAR_CLIENT_SECRET missing in environment variables');
+    throw new Error(
+      `NEXAR_CLIENT_ID or NEXAR_CLIENT_SECRET missing in environment variables ` +
+      `(ID present: ${!!clientId}, Secret present: ${!!clientSecret})`
+    );
   }
 
   if (cachedToken && Date.now() < cachedToken.expiresAt) {
+    console.log('[Nexar Proxy] Using cached token (expires in', Math.round((cachedToken.expiresAt - Date.now()) / 1000), 's)');
     return cachedToken.token;
   }
 
-  const body = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: clientId,
-    client_secret: clientSecret,
-    scope: 'user.access',
-  });
+  const params = new URLSearchParams();
+  params.append('grant_type', 'client_credentials');
+  params.append('client_id', clientId);
+  params.append('client_secret', clientSecret);
+  params.append('scope', 'user.access');
 
-  const res = await fetch(NEXAR_TOKEN_URL, {
+  console.log('[Nexar Proxy] Requesting OAuth token from', NEXAR_TOKEN_URL);
+
+  const tokenResponse = await fetch(NEXAR_TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
+    body: params.toString(),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Nexar OAuth failed [${res.status}] - Check API Keys: ${text.slice(0, 200)}`);
+  if (!tokenResponse.ok) {
+    const errorText = await tokenResponse.text();
+    let errorDetail = errorText;
+    try {
+      const errorJson = JSON.parse(errorText);
+      errorDetail = JSON.stringify(errorJson, null, 2);
+    } catch {
+      // keep raw text if not JSON
+    }
+    console.error(`[Nexar Proxy] OAuth token fetch failed [${tokenResponse.status}]:`, errorDetail);
+    throw new Error(
+      `OAuth token fetch failed [${tokenResponse.status} ${tokenResponse.statusText}]: ${errorDetail}`
+    );
   }
 
-  const data = (await res.json()) as NexarTokenResponse;
+  const tokenData = (await tokenResponse.json()) as NexarTokenResponse;
+
+  if (!tokenData.access_token) {
+    console.error('[Nexar Proxy] Token response missing access_token:', JSON.stringify(tokenData));
+    throw new Error('OAuth response did not contain access_token');
+  }
+
   cachedToken = {
-    token: data.access_token,
-    expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+    token: tokenData.access_token,
+    expiresAt: Date.now() + (tokenData.expires_in - 60) * 1000,
   };
+
+  console.log('[Nexar Proxy] Token acquired, expires in', tokenData.expires_in, 's');
   return cachedToken.token;
 }
 
 export async function GET(req: NextRequest) {
+  console.log('[Nexar Proxy] Request received:', req.url);
+  console.log('Nexar ID present:', !!process.env.NEXAR_CLIENT_ID);
+
   try {
     const { searchParams } = new URL(req.url);
     const query = searchParams.get('q') || '';
@@ -136,7 +165,7 @@ export async function GET(req: NextRequest) {
 
     const searchTerm = query || getDefaultQuery(category);
 
-    // Step 1: OAuth token retrieval
+    // Step 1: OAuth 2.0 token retrieval
     let token: string;
     try {
       token = await getNexarToken();
@@ -181,7 +210,7 @@ export async function GET(req: NextRequest) {
       variables: { term: searchTerm },
     });
 
-    console.log(`[Nexar Proxy] Querying: term="${searchTerm}", category="${category}"`);
+    console.log(`[Nexar Proxy] GraphQL query: term="${searchTerm}", category="${category}"`);
 
     let res: Response;
     try {
@@ -195,7 +224,7 @@ export async function GET(req: NextRequest) {
       });
     } catch (fetchErr) {
       const msg = fetchErr instanceof Error ? fetchErr.message : 'Network error';
-      console.error('[Nexar Proxy] Network/CORS error:', msg);
+      console.error('[Nexar Proxy] Network error fetching GraphQL:', msg);
       return NextResponse.json(
         { error: `Nexar Error: [CORS / Network Error] ${msg}`, parts: [], count: 0 },
         { status: 500 }
@@ -203,11 +232,18 @@ export async function GET(req: NextRequest) {
     }
 
     if (!res.ok) {
-      const text = await res.text();
+      const errorText = await res.text();
+      let errorDetail = errorText;
+      try {
+        const errorJson = JSON.parse(errorText);
+        errorDetail = JSON.stringify(errorJson, null, 2);
+      } catch {
+        // keep raw text
+      }
       const statusText = res.status === 401 ? 'Unauthorized - Check API Keys' : res.statusText;
-      console.error(`[Nexar Proxy] API error (${res.status}): ${text.slice(0, 300)}`);
+      console.error(`[Nexar Proxy] GraphQL API error [${res.status}]:`, errorDetail);
       return NextResponse.json(
-        { error: `Nexar Error: [${res.status} ${statusText}]`, parts: [], count: 0 },
+        { error: `Nexar Error: [${res.status} ${statusText}] ${errorDetail}`, parts: [], count: 0 },
         { status: res.status }
       );
     }
