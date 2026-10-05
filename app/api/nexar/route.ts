@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import axios from 'axios';
 
 export const runtime = 'nodejs';
 
@@ -48,56 +49,31 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // --- Step 1: Isolated OAuth token exchange ---
-  let accessToken = '';
   try {
-    const params = new URLSearchParams();
-    params.append('grant_type', 'client_credentials');
-    params.append('client_id', clientId);
-    params.append('client_secret', clientSecret);
-
-    const tokenRes = await fetch(NEXAR_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-      cache: 'no-store',
+    // --- Step 1: Fetch OAuth access token via axios ---
+    const tokenParams = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
     });
 
-    if (!tokenRes.ok) {
-      const errText = await tokenRes.text();
-      return NextResponse.json(
-        { error: `OAuth failed (${tokenRes.status}): ${errText}` },
-        { status: tokenRes.status }
-      );
-    }
+    const tokenRes = await axios.post(NEXAR_TOKEN_URL, tokenParams.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 10000,
+    });
 
-    const tokenData = await tokenRes.json();
-    accessToken = tokenData.access_token;
-
+    const accessToken = tokenRes.data.access_token;
     if (!accessToken) {
       return NextResponse.json(
         { error: 'OAuth succeeded but no access_token in response.' },
         { status: 500 }
       );
     }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return NextResponse.json(
-      { error: `OAuth Connection Error: ${msg}` },
-      { status: 500 }
-    );
-  }
 
-  // --- Step 2: Isolated GraphQL request ---
-  try {
-    const gqlRes = await fetch(NEXAR_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json, application/graphql-response+json',
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({
+    // --- Step 2: Fetch GraphQL data via axios ---
+    const gqlRes = await axios.post(
+      NEXAR_API_URL,
+      {
         query: `
           query SearchParts($q: String!) {
             supSearch(q: $q, limit: 10) {
@@ -119,21 +95,18 @@ export async function GET(req: NextRequest) {
             }
           }`,
         variables: { q: searchTerm || 'FPV' },
-      }),
-      cache: 'no-store',
-    });
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, application/graphql-response+json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        timeout: 10000,
+      }
+    );
 
-    const textData = await gqlRes.text();
-
-    let jsonData;
-    try {
-      jsonData = JSON.parse(textData);
-    } catch {
-      return NextResponse.json(
-        { error: `Non-JSON response from Nexar (${gqlRes.status}): ${textData.slice(0, 300)}` },
-        { status: gqlRes.status }
-      );
-    }
+    const jsonData = gqlRes.data;
 
     if (jsonData.errors && jsonData.errors.length > 0) {
       return NextResponse.json(
@@ -198,9 +171,20 @@ export async function GET(req: NextRequest) {
       hasMore: false,
     });
   } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      const errMsg = err.response?.data
+        ? typeof err.response.data === 'string'
+          ? err.response.data.slice(0, 500)
+          : JSON.stringify(err.response.data)
+        : err.message;
+      return NextResponse.json(
+        { error: `Nexar Request Failed: ${errMsg}` },
+        { status: err.response?.status || 500 }
+      );
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { error: `GraphQL Connection Error: ${msg}` },
+      { error: `Nexar Request Failed: ${msg}` },
       { status: 500 }
     );
   }
