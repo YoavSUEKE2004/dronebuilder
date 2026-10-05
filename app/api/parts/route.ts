@@ -233,7 +233,11 @@ async function fetchNexarParts(
   const clientSecret = process.env.NEXAR_CLIENT_SECRET;
 
   if (!clientId || !clientSecret) {
-    throw new Error('Nexar API keys missing or invalid in .env.local. Please check your developer credentials.');
+    throw new Error(
+      `Nexar credentials not configured on the server. ` +
+      `Ensure NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET are set in the server environment. ` +
+      `(ID present: ${!!clientId}, Secret present: ${!!clientSecret})`
+    );
   }
 
   const token = await getNexarToken();

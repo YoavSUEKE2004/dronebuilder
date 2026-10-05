@@ -383,13 +383,12 @@ export default function CategoryModal({
           </div>
         </div>
 
-        {/* Config error banner — red, shown when Nexar keys are missing/invalid */}
+        {/* Error banner — driven entirely by the server response from /api/nexar */}
         {showConfigError && (
           <div className="mx-6 mt-4 flex items-start gap-2 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/40 text-red-300 text-sm">
             <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
             <div>
-              <p className="font-semibold">Nexar API keys missing or invalid in .env.local. Please check your developer credentials.</p>
-              <p className="text-xs text-red-400/70 mt-1">{configError}</p>
+              <p className="font-semibold">{configError}</p>
             </div>
           </div>
         )}
