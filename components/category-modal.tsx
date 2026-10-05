@@ -229,7 +229,7 @@ export default function CategoryModal({
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-      const res = await fetch(`/api/parts?${params.toString()}`, { signal: controller.signal });
+      const res = await fetch(`/api/nexar?${params.toString()}`, { signal: controller.signal });
       clearTimeout(timeoutId);
 
       if (!res.ok) {
@@ -245,14 +245,10 @@ export default function CategoryModal({
         error?: string;
       };
 
-      // If the API returned an explicit error (e.g. missing Nexar keys), show the config banner
+      // If the API returned an explicit error (e.g. missing Nexar keys), show the error banner
       if (data.error && (!data.parts || data.parts.length === 0)) {
-        const isConfigIssue = data.error.includes('Nexar API keys') || data.error.includes('NEXAR_CLIENT');
-        if (isConfigIssue) {
-          setConfigError(data.error);
-        } else {
-          setWarning(data.error);
-        }
+        // All errors from /api/nexar are Nexar-related — show as config error banner
+        setConfigError(data.error);
         if (!append) setApiParts([]);
         setHasMore(false);
         setDataSource(data.source || 'empty');
@@ -280,12 +276,8 @@ export default function CategoryModal({
       setHasFetched(true);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Network error';
-      // Check if it's a Nexar config issue
-      if (msg.includes('Nexar API keys') || msg.includes('NEXAR_CLIENT')) {
-        setConfigError(msg);
-      } else {
-        setWarning(`Failed to fetch parts: ${msg}`);
-      }
+      // Show all fetch errors as Nexar errors
+      setConfigError(`Nexar Error: [CORS / Network Error] ${msg}`);
       if (!append) setApiParts([]);
       setHasMore(false);
       setHasFetched(true);

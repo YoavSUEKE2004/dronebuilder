@@ -1,0 +1,279 @@
+import { NextRequest, NextResponse } from 'next/server';
+
+export const runtime = 'nodejs';
+
+const NEXAR_API_URL = 'https://api.nexar.com/graphql';
+const NEXAR_TOKEN_URL = 'https://identity.nexus.autodesk.com/oauth2/v2/token';
+
+const DEFAULT_QUERIES: Record<string, string> = {
+  frame: 'FPV frame',
+  motor: 'brushless motor',
+  esc: 'ESC 4in1',
+  flight_controller: 'flight controller FC',
+  propeller: 'FPV propeller',
+  battery: 'lipo battery',
+  camera: 'FPV camera',
+  vtx: 'VTX 5.8GHz',
+  receiver: 'ELRS receiver',
+  goggles: 'FPV goggles',
+  remote: 'radio controller FPV',
+};
+
+function getDefaultQuery(category: string): string {
+  return DEFAULT_QUERIES[category] || category;
+}
+
+type NexarTokenResponse = {
+  access_token: string;
+  expires_in: number;
+  token_type: string;
+};
+
+type NexarGraphQLResponse = {
+  data?: {
+    supSearch?: {
+      results: Array<{
+        part: {
+          mpn: string;
+          name: string | null;
+          manufacturer: { name: string } | null;
+          shortDescription: string | null;
+          bestDatasheet: { url: string } | null;
+          bestImage: { url: string } | null;
+          medianPrice: { price: number; currency: string } | null;
+          sellers: Array<{
+            company: { name: string } | null;
+            offers: Array<{
+              clickUrl: string | null;
+              inventory: number | null;
+              prices: Array<{ price: number; currency: string; quantity: number }> | null;
+            }> | null;
+          }> | null;
+        };
+      }> | null;
+    };
+  };
+  errors?: Array<{ message: string }>;
+};
+
+type NexarPartResponse = {
+  id: string;
+  name: string;
+  manufacturer: string;
+  mpn: string;
+  description: string | null;
+  datasheetUrl: string | null;
+  image_url: string | null;
+  category: string;
+  price: number | null;
+  currency: string;
+  source: 'nexar';
+  offers: Array<{
+    seller: string;
+    url: string;
+    inStock: number | null;
+    price: number | null;
+    currency: string;
+  }>;
+  specs: Record<string, unknown>;
+  quality_score: number;
+  stock_status: string;
+};
+
+let cachedToken: { token: string; expiresAt: number } | null = null;
+
+async function getNexarToken(): Promise<string> {
+  const clientId = process.env.NEXAR_CLIENT_ID;
+  const clientSecret = process.env.NEXAR_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('NEXAR_CLIENT_ID or NEXAR_CLIENT_SECRET missing in environment variables');
+  }
+
+  if (cachedToken && Date.now() < cachedToken.expiresAt) {
+    return cachedToken.token;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: 'user.access',
+  });
+
+  const res = await fetch(NEXAR_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Nexar OAuth failed [${res.status}] - Check API Keys: ${text.slice(0, 200)}`);
+  }
+
+  const data = (await res.json()) as NexarTokenResponse;
+  cachedToken = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+  };
+  return cachedToken.token;
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const query = searchParams.get('q') || '';
+    const category = searchParams.get('category') || '';
+    const limit = Math.min(parseInt(searchParams.get('limit') || '10', 10), 50);
+
+    if (!query && !category) {
+      return NextResponse.json(
+        { error: 'Provide a search query via the "q" or "category" parameter' },
+        { status: 400 }
+      );
+    }
+
+    const searchTerm = query || getDefaultQuery(category);
+
+    // Step 1: OAuth token retrieval
+    let token: string;
+    try {
+      token = await getNexarToken();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown OAuth error';
+      console.error('[Nexar Proxy] Token error:', msg);
+      return NextResponse.json(
+        { error: `Nexar Error: ${msg}`, parts: [], count: 0 },
+        { status: 500 }
+      );
+    }
+
+    // Step 2: GraphQL query
+    const gqlQuery = `
+      query SearchParts($term: String!) {
+        supSearch(q: $term, limit: 10) {
+          results {
+            part {
+              mpn
+              name
+              manufacturer { name }
+              shortDescription
+              bestDatasheet { url }
+              bestImage { url }
+              medianPrice { price currency }
+              sellers {
+                company { name }
+                offers {
+                  clickUrl
+                  inventory
+                  prices { price currency quantity }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const payload = JSON.stringify({
+      query: gqlQuery,
+      variables: { term: searchTerm },
+    });
+
+    console.log(`[Nexar Proxy] Querying: term="${searchTerm}", category="${category}"`);
+
+    let res: Response;
+    try {
+      res = await fetch(NEXAR_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: payload,
+      });
+    } catch (fetchErr) {
+      const msg = fetchErr instanceof Error ? fetchErr.message : 'Network error';
+      console.error('[Nexar Proxy] Network/CORS error:', msg);
+      return NextResponse.json(
+        { error: `Nexar Error: [CORS / Network Error] ${msg}`, parts: [], count: 0 },
+        { status: 500 }
+      );
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      const statusText = res.status === 401 ? 'Unauthorized - Check API Keys' : res.statusText;
+      console.error(`[Nexar Proxy] API error (${res.status}): ${text.slice(0, 300)}`);
+      return NextResponse.json(
+        { error: `Nexar Error: [${res.status} ${statusText}]`, parts: [], count: 0 },
+        { status: res.status }
+      );
+    }
+
+    const result = (await res.json()) as NexarGraphQLResponse;
+
+    if (result.errors && result.errors.length > 0) {
+      const messages = result.errors.map((e) => e.message).join('; ');
+      console.error('[Nexar Proxy] GraphQL errors:', messages);
+      return NextResponse.json(
+        { error: `Nexar Error: [GraphQL] ${messages}`, parts: [], count: 0 },
+        { status: 500 }
+      );
+    }
+
+    const rawResults = result.data?.supSearch?.results || [];
+
+    const parts: NexarPartResponse[] = rawResults.map((r) => {
+      const part = r.part;
+      const sellers = part.sellers || [];
+      const offers = sellers.flatMap((s) =>
+        (s.offers || []).map((offer) => ({
+          seller: s.company?.name || '',
+          url: offer.clickUrl || '',
+          inStock: offer.inventory ?? null,
+          price: offer.prices?.[0]?.price ?? null,
+          currency: offer.prices?.[0]?.currency || 'USD',
+        }))
+      );
+
+      const totalStock = offers.reduce((sum, o) => sum + (o.inStock ?? 0), 0);
+      const stockStatus = totalStock > 10 ? 'in_stock' : totalStock > 0 ? 'low_stock' : 'unknown';
+
+      return {
+        id: part.mpn,
+        name: part.name || part.mpn,
+        manufacturer: part.manufacturer?.name || '',
+        mpn: part.mpn,
+        description: part.shortDescription,
+        datasheetUrl: part.bestDatasheet?.url || null,
+        image_url: part.bestImage?.url || null,
+        category: category || '',
+        price: part.medianPrice?.price ?? null,
+        currency: part.medianPrice?.currency || 'USD',
+        source: 'nexar' as const,
+        offers,
+        specs: {},
+        quality_score: 5,
+        stock_status: stockStatus,
+      };
+    });
+
+    console.log(`[Nexar Proxy] Returning ${parts.length} parts for term="${searchTerm}"`);
+
+    return NextResponse.json({
+      parts,
+      count: parts.length,
+      source: 'nexar',
+      hasMore: false,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to fetch parts';
+    console.error('[Nexar Proxy] Unhandled error:', message);
+    return NextResponse.json(
+      { error: `Nexar Error: ${message}`, parts: [], count: 0 },
+      { status: 500 }
+    );
+  }
+}
