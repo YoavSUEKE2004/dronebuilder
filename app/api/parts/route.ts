@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import fallbackParts from '@/lib/fallback-parts.json';
 
 export const runtime = 'nodejs';
 
@@ -8,21 +9,21 @@ const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
 const CACHE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ============================================================
-// DEFAULT BROAD QUERIES PER CATEGORY
+// DEFAULT BROAD QUERIES PER CATEGORY — short, generic terms
 // ============================================================
 
 const DEFAULT_QUERIES: Record<string, string> = {
-  frame: '5 inch FPV frame',
-  motor: '2207 brushless motor FPV',
-  esc: '4in1 ESC BLHeli',
-  flight_controller: 'F7 flight controller FPV',
-  propeller: '5 inch FPV propeller',
-  battery: 'FPV lipo battery 4S 6S',
-  camera: 'FPV camera analog digital',
-  vtx: 'FPV VTX 5.8GHz',
-  receiver: 'ELRS receiver FPV',
-  goggles: 'FPV goggles 5.8GHz',
-  remote: 'FPV radio controller',
+  frame: 'FPV frame',
+  motor: 'brushless motor',
+  esc: 'ESC',
+  flight_controller: 'flight controller',
+  propeller: 'FPV propeller',
+  battery: 'lipo battery',
+  camera: 'FPV camera',
+  vtx: 'VTX',
+  receiver: 'ELRS',
+  goggles: 'FPV goggles',
+  remote: 'radio controller',
 };
 
 function getDefaultQuery(category: string): string {
@@ -43,6 +44,25 @@ const supabaseServer = createClient(supabaseUrl!, supabaseServiceKey!, {
 // ============================================================
 // TYPES
 // ============================================================
+
+type FallbackPart = {
+  id: string;
+  name: string;
+  category: string;
+  brand: string;
+  mpn: string;
+  price: number;
+  store_name: string;
+  product_url: string;
+  image_url: string;
+  dimensions_mm: string;
+  mounting_pattern: string;
+  weight_g: number;
+  shipping_days: number;
+  shipping_cost: number;
+  quality_score: number;
+  specs: Record<string, unknown>;
+};
 
 type CachedNexarPart = {
   id: string;
@@ -82,7 +102,7 @@ type NormalizedPart = {
   category: string;
   price: number | null;
   currency: string;
-  source: 'cache' | 'nexar' | 'stale-cache';
+  source: 'cache' | 'nexar' | 'stale-cache' | 'fallback';
   offers: Array<{
     seller: string;
     url: string;
@@ -129,6 +149,49 @@ type NexarPart = {
 };
 
 // ============================================================
+// FALLBACK CATALOG
+// ============================================================
+
+const FALLBACK_PARTS = fallbackParts as FallbackPart[];
+
+function getFallbackParts(category: string, query: string, limit: number): NormalizedPart[] {
+  const q = query.toLowerCase().trim();
+  const parts = FALLBACK_PARTS.filter((p) => {
+    if (category && p.category !== category) return false;
+    if (!q) return true;
+    return (
+      p.name.toLowerCase().includes(q) ||
+      p.brand.toLowerCase().includes(q) ||
+      p.mpn.toLowerCase().includes(q) ||
+      p.store_name.toLowerCase().includes(q)
+    );
+  });
+  return parts.slice(0, limit).map((p) => ({
+    id: p.id,
+    name: p.name,
+    manufacturer: p.brand,
+    mpn: p.mpn,
+    description: null,
+    datasheetUrl: null,
+    image_url: p.image_url || null,
+    category: p.category,
+    price: p.price,
+    currency: 'USD',
+    source: 'fallback' as const,
+    offers: [{
+      seller: p.store_name,
+      url: p.product_url,
+      inStock: null,
+      price: p.price,
+      currency: 'USD',
+    }],
+    specs: p.specs,
+    quality_score: p.quality_score,
+    stock_status: 'unknown',
+  }));
+}
+
+// ============================================================
 // NEXAR AUTH
 // ============================================================
 
@@ -139,7 +202,8 @@ async function getNexarToken(): Promise<string> {
   const clientSecret = process.env.NEXAR_CLIENT_SECRET;
 
   if (!clientId || !clientSecret) {
-    throw new Error('NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET must be set');
+    console.error('[Nexar] No NEXAR_CLIENT_ID or NEXAR_CLIENT_SECRET configured');
+    throw new Error('Nexar credentials not configured');
   }
 
   if (cachedToken && Date.now() < cachedToken.expiresAt) {
@@ -160,6 +224,8 @@ async function getNexarToken(): Promise<string> {
   });
 
   if (!res.ok) {
+    const text = await res.text();
+    console.error(`[Nexar] Token request failed (${res.status}): ${text}`);
     throw new Error(`Nexar token request failed (${res.status})`);
   }
 
@@ -197,8 +263,11 @@ async function getCachedParts(
     .order('updated_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
+  if (error) {
+    console.error('[Supabase] Cache query error:', error.message);
+  }
+
   if (error || !data || data.length === 0) {
-    // Check if any rows exist in this category at all (for fallback)
     const { count: categoryCount } = await supabaseServer
       .from('cached_nexar_parts')
       .select('*', { count: 'exact', head: true })
@@ -254,12 +323,12 @@ async function upsertCachedParts(
     .upsert(rows, { onConflict: 'mpn,category' });
 
   if (error) {
-    // Non-fatal
+    console.error('[Supabase] Upsert error:', error.message);
   }
 }
 
 // ============================================================
-// NEXAR FETCH
+// NEXAR FETCH — with error logging
 // ============================================================
 
 async function fetchNexarParts(
@@ -267,6 +336,14 @@ async function fetchNexarParts(
   category: string,
   limit: number
 ): Promise<NormalizedPart[]> {
+  const clientId = process.env.NEXAR_CLIENT_ID;
+  const clientSecret = process.env.NEXAR_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    console.error('[Nexar] Skipping fetch — credentials not configured');
+    return [];
+  }
+
   try {
     const token = await getNexarToken();
 
@@ -296,24 +373,45 @@ async function fetchNexarParts(
       }
     `;
 
+    const payload = JSON.stringify({
+      query: gqlQuery,
+      variables: { search: searchTerm, limit },
+    });
+
+    console.log(`[Nexar] Querying: search="${searchTerm}", category="${category}", limit=${limit}`);
+
     const res = await fetch(NEXAR_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        query: gqlQuery,
-        variables: { search: searchTerm, limit },
-      }),
+      body: payload,
     });
 
-    if (!res.ok) return [];
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(`[Nexar] API error (${res.status}): ${text}`);
+      console.error(`[Nexar] Query payload: ${payload}`);
+      return [];
+    }
 
     const result = (await res.json()) as NexarGraphQLResponse;
-    if (result.errors && result.errors.length > 0) return [];
+
+    if (result.errors && result.errors.length > 0) {
+      console.error(`[Nexar] GraphQL errors:`, result.errors);
+      console.error(`[Nexar] Query payload: ${payload}`);
+      return [];
+    }
 
     const hits = result.data?.supSearch?.hits || [];
+
+    if (hits.length === 0) {
+      console.warn(`[Nexar] Zero results for search="${searchTerm}", category="${category}"`);
+      console.warn(`[Nexar] Query payload: ${payload}`);
+    } else {
+      console.log(`[Nexar] Got ${hits.length} results for search="${searchTerm}"`);
+    }
 
     return hits.map((hit) => {
       const part = hit.part;
@@ -346,7 +444,9 @@ async function fetchNexarParts(
         stock_status: stockStatus,
       };
     });
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[Nexar] Fetch failed for search="${searchTerm}": ${msg}`);
     return [];
   }
 }
@@ -402,6 +502,7 @@ export async function GET(req: NextRequest) {
     const category = searchParams.get('category') || '';
     const offset = parseInt(searchParams.get('offset') || '0', 10);
     const limit = Math.min(parseInt(searchParams.get('limit') || '20', 10), 50);
+    const isCustomSearch = !!query;
 
     if (!query && !category) {
       return NextResponse.json(
@@ -410,7 +511,6 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Use default broad query if only category is provided
     const searchTerm = query || getDefaultQuery(category);
 
     // 1. Check Supabase cache first — fresh data
@@ -444,7 +544,7 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    // 3. Nexar failed — try stale cache for this search
+    // 3. Nexar failed/empty — try stale cache for this search
     if (isStale) {
       const { parts: staleParts } = await getCachedParts(searchTerm, category, false, offset, limit);
       if (staleParts.length > 0) {
@@ -461,13 +561,13 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // 4. Last resort — return any parts cached in this category regardless of search term
+    // 4. Try any cached parts in this category regardless of search term
     if (category) {
-      const fallbackParts = await getAnyCategoryParts(category, limit);
-      if (fallbackParts.length > 0) {
+      const anyParts = await getAnyCategoryParts(category, limit);
+      if (anyParts.length > 0) {
         return NextResponse.json({
-          parts: fallbackParts,
-          count: fallbackParts.length,
+          parts: anyParts,
+          count: anyParts.length,
           source: 'stale-cache',
           warning: 'No exact match found, showing other cached parts in this category',
           offset: 0,
@@ -477,18 +577,40 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // 5. Nothing at all
+    // 5. LAST RESORT — inject pre-seeded fallback catalog (never show empty screen on initial load)
+    const fallback = getFallbackParts(category, query, limit);
+    if (fallback.length > 0) {
+      // Also upsert fallback into Supabase so future queries hit cache
+      await upsertCachedParts(fallback, searchTerm);
+
+      return NextResponse.json({
+        parts: fallback,
+        count: fallback.length,
+        source: 'fallback',
+        warning: isCustomSearch
+          ? 'No live results found. Showing catalog fallback parts.'
+          : 'Showing default catalog. Live pricing may be unavailable.',
+        offset: 0,
+        limit,
+        hasMore: false,
+      });
+    }
+
+    // 6. Absolute last resort — empty (only reached if fallback catalog has no match for category)
     return NextResponse.json({
       parts: [],
       count: 0,
       source: 'empty',
-      warning: 'No parts found. Try a different search term.',
+      warning: isCustomSearch
+        ? 'No parts found for your search. Try a different term.'
+        : 'No parts available for this category.',
       offset,
       limit,
       hasMore: false,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to fetch parts';
+    console.error('[Parts API] Unhandled error:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

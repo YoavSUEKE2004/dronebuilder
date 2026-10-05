@@ -195,6 +195,8 @@ export default function CategoryModal({
   const [loadingMore, setLoadingMore] = useState(false);
   const [warning, setWarning] = useState<string | null>(null);
   const [hasFetched, setHasFetched] = useState(false);
+  const [dataSource, setDataSource] = useState<string>('');
+  const [isCustomSearch, setIsCustomSearch] = useState(false);
 
   // Seed from parent components initially
   const seededComponents = useMemo(
@@ -217,6 +219,7 @@ export default function CategoryModal({
       setLoadingParts(true);
     }
     setWarning(null);
+    setIsCustomSearch(!!q);
 
     try {
       const params = new URLSearchParams();
@@ -248,13 +251,13 @@ export default function CategoryModal({
         setApiParts(newParts);
       }
 
-      // Notify parent so compatibility engine and 3D canvas can see these parts
       if (onPartsLoaded) {
         onPartsLoaded(append ? [...apiParts, ...newParts] : newParts);
       }
 
       setHasMore(data.hasMore ?? false);
       setWarning(data.warning ?? null);
+      setDataSource(data.source ?? '');
       setHasFetched(true);
     } catch {
       setWarning('Network error. Please try again.');
@@ -264,7 +267,7 @@ export default function CategoryModal({
       setLoadingParts(false);
       setLoadingMore(false);
     }
-  }, [category]);
+  }, [category, onPartsLoaded, apiParts]);
 
   // Initial load when modal opens for a new category
   useEffect(() => {
@@ -348,6 +351,10 @@ export default function CategoryModal({
             <h2 className="text-lg font-bold text-white">{categoryLabel} Selection</h2>
             <p className="text-xs text-slate-500">
               {showSkeletons ? 'Loading parts...' : `${filtered.length} options available`}
+              {dataSource === 'fallback' && <span className="ml-2 text-amber-400">· Catalog mode</span>}
+              {dataSource === 'cache' && <span className="ml-2 text-emerald-400">· Cached</span>}
+              {dataSource === 'nexar' && <span className="ml-2 text-cyan-400">· Live data</span>}
+              {dataSource === 'stale-cache' && <span className="ml-2 text-amber-400">· Cached (offline)</span>}
               {frame && <span className="ml-2 text-cyan-400">· Filtered for your {frame.name}</span>}
             </p>
           </div>
@@ -607,19 +614,17 @@ export default function CategoryModal({
                   </div>
                 )}
 
-                {/* Empty state */}
-                {filtered.length === 0 && !loadingParts && (
+                {/* Empty state — only on explicit custom searches */}
+                {filtered.length === 0 && !loadingParts && isCustomSearch && (
                   <div className="flex flex-col items-center justify-center py-12 text-center">
                     <AlertCircle className="w-8 h-8 text-slate-600 mb-2" />
                     <p className="text-sm text-slate-500">No parts match your search criteria</p>
-                    {searchQuery && (
-                      <button
-                        onClick={() => { setSearchQuery(''); handleSearch(); }}
-                        className="mt-3 text-xs text-cyan-400 hover:text-cyan-300"
-                      >
-                        Clear search and reload
-                      </button>
-                    )}
+                    <button
+                      onClick={() => { setSearchQuery(''); handleSearch(); }}
+                      className="mt-3 text-xs text-cyan-400 hover:text-cyan-300"
+                    >
+                      Clear search and reload
+                    </button>
                   </div>
                 )}
               </>
