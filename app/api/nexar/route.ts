@@ -37,17 +37,13 @@ type NexarGraphQLResponse = {
         part: {
           mpn: string;
           name: string | null;
-          manufacturer: { name: string } | null;
           shortDescription: string | null;
           bestDatasheet: { url: string } | null;
-          bestImage: { url: string } | null;
-          medianPrice: { price: number; currency: string } | null;
           sellers: Array<{
             company: { name: string } | null;
             offers: Array<{
               clickUrl: string | null;
-              inventory: number | null;
-              prices: Array<{ price: number; currency: string; quantity: number }> | null;
+              prices: Array<{ price: number; currency: string }> | null;
             }> | null;
           }> | null;
         };
@@ -210,38 +206,38 @@ export async function GET(req: NextRequest) {
     }
 
     // Step 2: GraphQL query (with 10s timeout)
-    const gqlQuery = `
-      query SearchParts($term: String!) {
-        supSearch(q: $term, limit: 10) {
-          results {
-            part {
-              mpn
-              name
-              manufacturer { name }
-              shortDescription
-              bestDatasheet { url }
-              bestImage { url }
-              medianPrice { price currency }
-              sellers {
-                company { name }
-                offers {
-                  clickUrl
-                  inventory
-                  prices { price currency quantity }
+    const payload = JSON.stringify({
+      query: `
+        query SearchParts($q: String!) {
+          supSearch(q: $q, limit: 10) {
+            results {
+              part {
+                mpn
+                name
+                shortDescription
+                bestDatasheet {
+                  url
+                }
+                sellers {
+                  company {
+                    name
+                  }
+                  offers {
+                    clickUrl
+                    prices {
+                      price
+                      currency
+                    }
+                  }
                 }
               }
             }
           }
-        }
-      }
-    `;
-
-    const payload = JSON.stringify({
-      query: gqlQuery,
-      variables: { term: searchTerm },
+        }`,
+      variables: { q: searchTerm || 'FPV' },
     });
 
-    console.log(`[Nexar Proxy] GraphQL query: term="${searchTerm}", category="${category}"`);
+    console.log(`[Nexar Proxy] GraphQL query: q="${searchTerm || 'FPV'}", category="${category}"`);
 
     let res: Response;
     try {
@@ -251,6 +247,7 @@ export async function GET(req: NextRequest) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            Accept: 'application/json, application/graphql-response+json',
             Authorization: `Bearer ${token}`,
           },
           body: payload,
@@ -267,47 +264,39 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    if (!res.ok) {
-      const errorText = await res.text();
-      const gqlContentType = res.headers.get('content-type') || '';
-      let errorDetail: string;
-      if (gqlContentType.includes('application/json')) {
-        try {
-          const errorJson = JSON.parse(errorText);
-          errorDetail = JSON.stringify(errorJson, null, 2);
-        } catch {
-          errorDetail = errorText.slice(0, 500);
-        }
-      } else {
-        errorDetail = `Non-JSON response (${gqlContentType || 'unknown content-type'}). Status: ${res.statusText}`;
-      }
+    // Parse the response body as JSON even on HTTP 400 — Nexar returns error
+    // arrays in JSON format for GraphQL syntax/validation errors.
+    const rawBody = await res.text();
+    let result: NexarGraphQLResponse;
+    try {
+      result = JSON.parse(rawBody) as NexarGraphQLResponse;
+    } catch {
       const statusText = res.status === 401 ? 'Unauthorized - Check API Keys' : res.statusText;
-      console.error(`[Nexar Proxy] GraphQL API error [${res.status}]:`, errorDetail);
+      console.error(`[Nexar Proxy] GraphQL endpoint returned non-JSON [${res.status} ${statusText}]:`, rawBody.slice(0, 500));
       return NextResponse.json(
-        { error: `Nexar Error: [${res.status} ${statusText}] ${errorDetail}`, parts: [], count: 0 },
+        { error: `Nexar Error: [${res.status} ${statusText}] Non-JSON response: ${rawBody.slice(0, 300)}`, parts: [], count: 0 },
         { status: res.status }
       );
     }
 
-    // Guard against HTML error pages on the GraphQL endpoint
-    const gqlContentType = res.headers.get('content-type') || '';
-    if (!gqlContentType.includes('application/json')) {
-      const bodyPreview = await res.text().catch(() => '<unreadable>');
-      console.error(`[Nexar Proxy] GraphQL endpoint returned non-JSON content-type: ${gqlContentType}`);
+    // Check for GraphQL errors in the parsed body (present even on HTTP 400)
+    if (result.errors && result.errors.length > 0) {
+      const message = result.errors[0].message;
+      console.error('[Nexar Proxy] GraphQL errors:', message);
       return NextResponse.json(
-        { error: `Nexar Error: GraphQL endpoint returned non-JSON (content-type: ${gqlContentType || 'none'}, status: ${res.statusText}). Body: ${bodyPreview.slice(0, 200)}`, parts: [], count: 0 },
-        { status: 502 }
+        { error: message, parts: [], count: 0 },
+        { status: res.status === 200 ? 400 : res.status }
       );
     }
 
-    const result = (await res.json()) as NexarGraphQLResponse;
-
-    if (result.errors && result.errors.length > 0) {
-      const messages = result.errors.map((e) => e.message).join('; ');
-      console.error('[Nexar Proxy] GraphQL errors:', messages);
+    // If the HTTP status is not OK but there were no GraphQL errors array,
+    // surface the raw body as the error detail.
+    if (!res.ok) {
+      const statusText = res.status === 401 ? 'Unauthorized - Check API Keys' : res.statusText;
+      console.error(`[Nexar Proxy] GraphQL API error [${res.status}]:`, rawBody.slice(0, 500));
       return NextResponse.json(
-        { error: `Nexar Error: [GraphQL] ${messages}`, parts: [], count: 0 },
-        { status: 500 }
+        { error: `Nexar Error: [${res.status} ${statusText}] ${rawBody.slice(0, 300)}`, parts: [], count: 0 },
+        { status: res.status }
       );
     }
 
@@ -320,26 +309,25 @@ export async function GET(req: NextRequest) {
         (s.offers || []).map((offer) => ({
           seller: s.company?.name || '',
           url: offer.clickUrl || '',
-          inStock: offer.inventory ?? null,
+          inStock: null,
           price: offer.prices?.[0]?.price ?? null,
           currency: offer.prices?.[0]?.currency || 'USD',
         }))
       );
 
-      const totalStock = offers.reduce((sum, o) => sum + (o.inStock ?? 0), 0);
-      const stockStatus = totalStock > 10 ? 'in_stock' : totalStock > 0 ? 'low_stock' : 'unknown';
+      const stockStatus = offers.some((o) => o.price !== null) ? 'in_stock' : 'unknown';
 
       return {
         id: part.mpn,
         name: part.name || part.mpn,
-        manufacturer: part.manufacturer?.name || '',
+        manufacturer: '',
         mpn: part.mpn,
         description: part.shortDescription,
         datasheetUrl: part.bestDatasheet?.url || null,
-        image_url: part.bestImage?.url || null,
+        image_url: null,
         category: category || '',
-        price: part.medianPrice?.price ?? null,
-        currency: part.medianPrice?.currency || 'USD',
+        price: offers.find((o) => o.price !== null)?.price ?? null,
+        currency: offers.find((o) => o.price !== null)?.currency || 'USD',
         source: 'nexar' as const,
         offers,
         specs: {},
