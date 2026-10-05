@@ -105,7 +105,6 @@ async function getNexarToken(): Promise<string> {
   params.append('grant_type', 'client_credentials');
   params.append('client_id', clientId);
   params.append('client_secret', clientSecret);
-  params.append('scope', 'user.access');
 
   console.log('[Nexar Proxy] Requesting OAuth token from', NEXAR_TOKEN_URL);
 
