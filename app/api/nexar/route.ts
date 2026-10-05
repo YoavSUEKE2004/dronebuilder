@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 
 const NEXAR_API_URL = 'https://api.nexar.com/graphql';
-const NEXAR_TOKEN_URL = 'https://identity.nexus.autodesk.com/oauth2/v2/token';
+const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
 
 const DEFAULT_QUERIES: Record<string, string> = {
   frame: 'FPV frame',
@@ -115,18 +115,35 @@ async function getNexarToken(): Promise<string> {
     body: params.toString(),
   });
 
+  const tokenContentType = tokenResponse.headers.get('content-type') || '';
+
   if (!tokenResponse.ok) {
     const errorText = await tokenResponse.text();
-    let errorDetail = errorText;
-    try {
-      const errorJson = JSON.parse(errorText);
-      errorDetail = JSON.stringify(errorJson, null, 2);
-    } catch {
-      // keep raw text if not JSON
+    let errorDetail: string;
+    if (tokenContentType.includes('application/json')) {
+      try {
+        const errorJson = JSON.parse(errorText);
+        errorDetail = JSON.stringify(errorJson, null, 2);
+      } catch {
+        errorDetail = errorText.slice(0, 500);
+      }
+    } else {
+      // HTML error page (e.g. Cloudflare 530) — don't try to parse as JSON
+      errorDetail = `Non-JSON response (${tokenContentType || 'unknown content-type'}). Status: ${tokenResponse.statusText}`;
     }
     console.error(`[Nexar Proxy] OAuth token fetch failed [${tokenResponse.status}]:`, errorDetail);
     throw new Error(
       `OAuth token fetch failed [${tokenResponse.status} ${tokenResponse.statusText}]: ${errorDetail}`
+    );
+  }
+
+  // Guard against HTML error pages being parsed as JSON
+  if (!tokenContentType.includes('application/json')) {
+    const bodyPreview = await tokenResponse.text().catch(() => '<unreadable>');
+    console.error(`[Nexar Proxy] Token endpoint returned non-JSON content-type: ${tokenContentType}`);
+    throw new Error(
+      `Token endpoint returned non-JSON response (content-type: ${tokenContentType || 'none'}). ` +
+      `Status: ${tokenResponse.statusText}. Body preview: ${bodyPreview.slice(0, 200)}`
     );
   }
 
@@ -233,18 +250,34 @@ export async function GET(req: NextRequest) {
 
     if (!res.ok) {
       const errorText = await res.text();
-      let errorDetail = errorText;
-      try {
-        const errorJson = JSON.parse(errorText);
-        errorDetail = JSON.stringify(errorJson, null, 2);
-      } catch {
-        // keep raw text
+      const gqlContentType = res.headers.get('content-type') || '';
+      let errorDetail: string;
+      if (gqlContentType.includes('application/json')) {
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorDetail = JSON.stringify(errorJson, null, 2);
+        } catch {
+          errorDetail = errorText.slice(0, 500);
+        }
+      } else {
+        errorDetail = `Non-JSON response (${gqlContentType || 'unknown content-type'}). Status: ${res.statusText}`;
       }
       const statusText = res.status === 401 ? 'Unauthorized - Check API Keys' : res.statusText;
       console.error(`[Nexar Proxy] GraphQL API error [${res.status}]:`, errorDetail);
       return NextResponse.json(
         { error: `Nexar Error: [${res.status} ${statusText}] ${errorDetail}`, parts: [], count: 0 },
         { status: res.status }
+      );
+    }
+
+    // Guard against HTML error pages on the GraphQL endpoint
+    const gqlContentType = res.headers.get('content-type') || '';
+    if (!gqlContentType.includes('application/json')) {
+      const bodyPreview = await res.text().catch(() => '<unreadable>');
+      console.error(`[Nexar Proxy] GraphQL endpoint returned non-JSON content-type: ${gqlContentType}`);
+      return NextResponse.json(
+        { error: `Nexar Error: GraphQL endpoint returned non-JSON (content-type: ${gqlContentType || 'none'}, status: ${res.statusText}). Body: ${bodyPreview.slice(0, 200)}`, parts: [], count: 0 },
+        { status: 502 }
       );
     }
 
