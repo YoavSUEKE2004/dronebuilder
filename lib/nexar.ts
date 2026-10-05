@@ -1,6 +1,36 @@
-import { NextRequest, NextResponse } from 'next/server';
+export type NexarOffer = {
+  seller: string;
+  url: string;
+  inStock: number | null;
+  price: number | null;
+  currency: string;
+};
 
-export const runtime = 'nodejs';
+export type NexarPart = {
+  id: string;
+  name: string;
+  manufacturer: string;
+  mpn: string;
+  description: string | null;
+  datasheetUrl: string | null;
+  image_url: string | null;
+  category: string;
+  price: number | null;
+  currency: string;
+  source: 'nexar';
+  offers: NexarOffer[];
+  specs: Record<string, unknown>;
+  quality_score: number;
+  stock_status: string;
+};
+
+export type NexarSearchResult = {
+  parts: NexarPart[];
+  count: number;
+  source: 'nexar';
+  hasMore: boolean;
+  error?: string;
+};
 
 const NEXAR_API_URL = 'https://api.nexar.com/graphql';
 
@@ -22,43 +52,40 @@ function getDefaultQuery(category: string): string {
   return DEFAULT_QUERIES[category] || category;
 }
 
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const query = searchParams.get('q') || '';
-  const category = searchParams.get('category') || '';
+export function getNexarToken(): string | null {
+  return process.env.NEXT_PUBLIC_NEXAR_TOKEN?.trim() || null;
+}
 
-  if (!query && !category) {
-    return NextResponse.json(
-      { error: 'Provide a search query via the "q" or "category" parameter' },
-      { status: 400 }
-    );
+export async function searchNexarParts(
+  query: string,
+  category: string,
+  limit = 20
+): Promise<NexarSearchResult> {
+  const token = getNexarToken();
+  if (!token) {
+    return {
+      parts: [],
+      count: 0,
+      source: 'nexar',
+      hasMore: false,
+      error: 'NEXT_PUBLIC_NEXAR_TOKEN is missing. Add it to your .env file to enable live parts search.',
+    };
   }
 
   const searchTerm = query || getDefaultQuery(category);
 
-  const token = (process.env.NEXAR_TOKEN || '').trim();
-
-  if (!token) {
-    return NextResponse.json(
-      { error: 'NEXAR_TOKEN is missing in .env environment variables.' },
-      { status: 400 }
-    );
-  }
-
   try {
-    const gqlRes = await fetch(NEXAR_API_URL, {
+    const res = await fetch(NEXAR_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json, application/graphql-response+json',
         'Authorization': `Bearer ${token}`,
-        'Connection': 'close',
-        'User-Agent': 'FPVConfigurator/1.0',
       },
       body: JSON.stringify({
         query: `
-          query SearchParts($q: String!) {
-            supSearch(q: $q, limit: 10) {
+          query SearchParts($q: String!, $limit: Int!) {
+            supSearch(q: $q, limit: $limit) {
               results {
                 part {
                   mpn
@@ -69,6 +96,7 @@ export async function GET(req: NextRequest) {
                     company { name }
                     offers {
                       clickUrl
+                      inventory
                       prices { price currency }
                     }
                   }
@@ -76,21 +104,24 @@ export async function GET(req: NextRequest) {
               }
             }
           }`,
-        variables: { q: searchTerm || 'FPV' },
+        variables: { q: searchTerm || 'FPV', limit },
       }),
       cache: 'no-store',
     });
 
-    const gqlText = await gqlRes.text();
+    const text = await res.text();
 
-    if (!gqlRes.ok) {
-      return NextResponse.json(
-        { error: `GraphQL Endpoint Error (${gqlRes.status}): ${gqlText.slice(0, 500)}` },
-        { status: gqlRes.status }
-      );
+    if (!res.ok) {
+      return {
+        parts: [],
+        count: 0,
+        source: 'nexar',
+        hasMore: false,
+        error: `Nexar API error (${res.status}): ${text.slice(0, 300)}`,
+      };
     }
 
-    let gqlData: {
+    let data: {
       errors?: Array<{ message: string }>;
       data?: {
         supSearch?: {
@@ -104,6 +135,7 @@ export async function GET(req: NextRequest) {
                 company: { name: string } | null;
                 offers: Array<{
                   clickUrl: string | null;
+                  inventory: number | null;
                   prices: Array<{ price: number; currency: string }> | null;
                 }> | null;
               }> | null;
@@ -112,38 +144,47 @@ export async function GET(req: NextRequest) {
         };
       };
     };
+
     try {
-      gqlData = JSON.parse(gqlText);
+      data = JSON.parse(text);
     } catch {
-      return NextResponse.json(
-        { error: 'GraphQL response was not valid JSON.' },
-        { status: 500 }
-      );
+      return {
+        parts: [],
+        count: 0,
+        source: 'nexar',
+        hasMore: false,
+        error: 'Nexar returned an invalid response. Please try again.',
+      };
     }
 
-    if (gqlData.errors && gqlData.errors.length > 0) {
-      return NextResponse.json(
-        { error: gqlData.errors[0].message },
-        { status: 400 }
-      );
+    if (data.errors && data.errors.length > 0) {
+      return {
+        parts: [],
+        count: 0,
+        source: 'nexar',
+        hasMore: false,
+        error: data.errors[0].message,
+      };
     }
 
-    const rawResults = gqlData.data?.supSearch?.results || [];
+    const rawResults = data.data?.supSearch?.results || [];
 
-    const parts = rawResults.map((r) => {
+    const parts: NexarPart[] = rawResults.map((r) => {
       const part = r.part;
       const sellers = part.sellers || [];
-      const offers = sellers.flatMap((s) =>
+      const offers: NexarOffer[] = sellers.flatMap((s) =>
         (s.offers || []).map((offer) => ({
           seller: s.company?.name || '',
           url: offer.clickUrl || '',
-          inStock: null,
+          inStock: offer.inventory ?? null,
           price: offer.prices?.[0]?.price ?? null,
           currency: offer.prices?.[0]?.currency || 'USD',
         }))
       );
 
       const firstOffer = offers.find((o) => o.price !== null);
+      const totalStock = offers.reduce((sum, o) => sum + (o.inStock ?? 0), 0);
+      const stockStatus = totalStock > 10 ? 'in_stock' : totalStock > 0 ? 'low_stock' : 'unknown';
 
       return {
         id: part.mpn,
@@ -160,21 +201,24 @@ export async function GET(req: NextRequest) {
         offers,
         specs: {},
         quality_score: 5,
-        stock_status: offers.some((o) => o.price !== null) ? 'in_stock' : 'unknown',
+        stock_status: stockStatus,
       };
     });
 
-    return NextResponse.json({
+    return {
       parts,
       count: parts.length,
       source: 'nexar',
-      hasMore: false,
-    });
-  } catch (err: unknown) {
+      hasMore: parts.length === limit,
+    };
+  } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return NextResponse.json(
-      { error: `Nexar Request Failed: ${msg}` },
-      { status: 500 }
-    );
+    return {
+      parts: [],
+      count: 0,
+      source: 'nexar',
+      hasMore: false,
+      error: `Nexar Request Failed: ${msg}`,
+    };
   }
 }

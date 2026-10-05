@@ -9,6 +9,7 @@ import {
 import type { ComponentWithSpecs, SelectedParts } from '@/lib/supabase';
 import { isCompatibleWithFrame } from '@/lib/frameCompatibility';
 import { cn } from '@/lib/utils';
+import { searchNexarParts, getNexarToken, type NexarPart } from '@/lib/nexar';
 
 type Props = {
   isOpen: boolean;
@@ -26,31 +27,7 @@ type Props = {
   onPartsLoaded?: (parts: ComponentWithSpecs[]) => void;
 };
 
-type ApiPart = {
-  id: string;
-  name: string;
-  manufacturer: string;
-  mpn: string;
-  description: string | null;
-  datasheetUrl: string | null;
-  image_url: string | null;
-  category: string;
-  price: number | null;
-  currency: string;
-  source: string;
-  offers: Array<{
-    seller: string;
-    url: string;
-    inStock: number | null;
-    price: number | null;
-    currency: string;
-  }>;
-  specs: Record<string, unknown>;
-  quality_score: number;
-  stock_status: string;
-};
-
-function apiPartToComponent(p: ApiPart): ComponentWithSpecs {
+function apiPartToComponent(p: NexarPart): ComponentWithSpecs {
   const specs = (p.specs || {}) as Record<string, unknown>;
   return {
     id: p.id,
@@ -169,8 +146,6 @@ function PartSkeleton() {
   );
 }
 
-const FETCH_TIMEOUT_MS = 15000;
-const ABORT_RETRY_DELAY_MS = 300;
 
 export default function CategoryModal({
   isOpen, onClose, onNext, onShow3D, onSkip, category, categoryLabel, nextCategoryLabel, components, selectedParts, onSelect, frame, onPartsLoaded,
@@ -207,7 +182,7 @@ export default function CategoryModal({
     return seededComponents;
   }, [apiParts, hasFetched, seededComponents]);
 
-  const fetchParts = useCallback(async (q: string, off: number, append: boolean, isRetry = false) => {
+  const fetchParts = useCallback(async (q: string, off: number, append: boolean) => {
     if (fetchInProgressRef.current) return;
     fetchInProgressRef.current = true;
 
@@ -221,42 +196,19 @@ export default function CategoryModal({
     const cat = categoryRef.current;
 
     const doFetch = async (): Promise<void> => {
-      const params = new URLSearchParams();
-      if (q) params.set('q', q);
-      if (cat) params.set('category', cat);
-      params.set('limit', '20');
-      params.set('offset', String(off));
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
       try {
-        const res = await fetch(`/api/nexar?${params.toString()}`, { signal: controller.signal });
-        clearTimeout(timeoutId);
+        const data = await searchNexarParts(q, cat, 20);
 
-        if (!res.ok) {
-          const errBody = await res.json().catch(() => ({}));
-          throw new Error(errBody.error || `API returned ${res.status}`);
-        }
-
-        const data = (await res.json()) as {
-          parts?: ApiPart[];
-          hasMore?: boolean;
-          warning?: string;
-          source?: string;
-          error?: string;
-        };
-
-        if (data.error && (!data.parts || data.parts.length === 0)) {
+        if (data.error && data.parts.length === 0) {
           setConfigError(data.error);
           if (!append) setApiParts([]);
           setHasMore(false);
-          setDataSource(data.source || 'empty');
+          setDataSource('empty');
           setHasFetched(true);
           return;
         }
 
-        const newParts = (data.parts || []).map(apiPartToComponent);
+        const newParts = data.parts.map(apiPartToComponent);
 
         let combined: ComponentWithSpecs[];
         if (append) {
@@ -270,23 +222,12 @@ export default function CategoryModal({
         setApiParts(combined);
         if (onPartsLoadedRef.current) onPartsLoadedRef.current(combined);
 
-        setHasMore(data.hasMore ?? false);
-        setWarning(data.warning ?? null);
-        setDataSource(data.source ?? '');
+        setHasMore(data.hasMore);
+        setDataSource(data.source);
         setHasFetched(true);
       } catch (err) {
-        clearTimeout(timeoutId);
-        const isAbort = err instanceof Error && err.name === 'AbortError';
-
-        if (isAbort && !isRetry) {
-          await new Promise((r) => setTimeout(r, ABORT_RETRY_DELAY_MS));
-          return doFetch();
-        }
-
-        if (!isAbort) {
-          const msg = err instanceof Error ? err.message : 'Network error';
-          setConfigError(`Nexar Error: ${msg}`);
-        }
+        const msg = err instanceof Error ? err.message : 'Network error';
+        setConfigError(`Nexar Error: ${msg}`);
         if (!append) setApiParts([]);
         setHasMore(false);
         setHasFetched(true);
@@ -405,12 +346,17 @@ export default function CategoryModal({
           </div>
         </div>
 
-        {/* Error banner — driven entirely by the server response from /api/nexar */}
+        {/* Error banner */}
         {showConfigError && (
           <div className="mx-6 mt-4 flex items-start gap-2 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/40 text-red-300 text-sm">
             <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
             <div>
               <p className="font-semibold">{configError}</p>
+              {!getNexarToken() && (
+                <p className="mt-1 text-xs text-red-400/70">
+                  Add NEXT_PUBLIC_NEXAR_TOKEN to your .env file to enable live parts search.
+                </p>
+              )}
             </div>
           </div>
         )}
