@@ -1,18 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import axios from 'axios';
-import https from 'https';
 
 export const runtime = 'nodejs';
 
-const httpsAgent = new https.Agent({ keepAlive: false });
+const NEXAR_API_URL = 'https://api.nexar.com/graphql';
+const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
 
 const NEXAR_HEADERS = {
   'Connection': 'close',
   'User-Agent': 'FPVConfigurator/1.0',
 };
-
-const NEXAR_API_URL = 'https://api.nexar.com/graphql';
-const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
 
 const DEFAULT_QUERIES: Record<string, string> = {
   frame: 'FPV frame',
@@ -46,105 +42,147 @@ export async function GET(req: NextRequest) {
 
   const searchTerm = query || getDefaultQuery(category);
 
-  // --- Step 0: Validate environment keys ---
   const clientId = (process.env.NEXAR_CLIENT_ID || '').trim();
   const clientSecret = (process.env.NEXAR_CLIENT_SECRET || '').trim();
 
   if (!clientId || !clientSecret) {
     return NextResponse.json(
-      { error: 'Nexar credentials are missing in server environment variables.' },
+      { error: 'NEXAR_CLIENT_ID or NEXAR_CLIENT_SECRET is missing in environment variables.' },
       { status: 400 }
     );
   }
 
   try {
-    // --- Step 1: Fetch OAuth access token via axios ---
+    // --- Step 1: Fetch OAuth access token via native fetch ---
     const tokenParams = new URLSearchParams({
       grant_type: 'client_credentials',
       client_id: clientId,
       client_secret: clientSecret,
     });
 
-    const tokenRes = await axios.post(NEXAR_TOKEN_URL, tokenParams.toString(), {
+    const tokenRes = await fetch(NEXAR_TOKEN_URL, {
+      method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         ...NEXAR_HEADERS,
       },
-      httpsAgent,
-      timeout: 12000,
+      body: tokenParams.toString(),
+      cache: 'no-store',
     });
 
-    const accessToken = tokenRes.data.access_token;
-    if (!accessToken) {
+    const tokenText = await tokenRes.text();
+    if (!tokenRes.ok) {
       return NextResponse.json(
-        { error: 'OAuth succeeded but no access_token in response.' },
+        { error: `OAuth Token Error (${tokenRes.status}): ${tokenText.slice(0, 500)}` },
+        { status: tokenRes.status }
+      );
+    }
+
+    let tokenData: { access_token?: string };
+    try {
+      tokenData = JSON.parse(tokenText);
+    } catch {
+      return NextResponse.json(
+        { error: 'OAuth token response was not valid JSON.' },
         { status: 500 }
       );
     }
 
-    // --- Step 2: Fetch GraphQL data via axios ---
-    const gqlRes = await axios.post(
-      NEXAR_API_URL,
-      {
-        query: `
-          query SearchParts($q: String!) {
-            supSearch(q: $q, limit: 10) {
-              results {
-                part {
-                  mpn
-                  name
-                  shortDescription
-                  bestDatasheet { url }
-                  sellers {
-                    company { name }
-                    offers {
-                      clickUrl
-                      prices { price currency }
-                    }
+    const accessToken = tokenData.access_token;
+    if (!accessToken) {
+      return NextResponse.json(
+        { error: 'No access token returned from Nexar identity endpoint.' },
+        { status: 500 }
+      );
+    }
+
+    // --- Step 2: Fetch GraphQL data via native fetch ---
+    const gqlBody = JSON.stringify({
+      query: `
+        query SearchParts($q: String!) {
+          supSearch(q: $q, limit: 10) {
+            results {
+              part {
+                mpn
+                name
+                shortDescription
+                bestDatasheet { url }
+                sellers {
+                  company { name }
+                  offers {
+                    clickUrl
+                    prices { price currency }
                   }
                 }
               }
             }
-          }`,
-        variables: { q: searchTerm || 'FPV' },
+          }
+        }`,
+      variables: { q: searchTerm || 'FPV' },
+    });
+
+    const gqlRes = await fetch(NEXAR_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, application/graphql-response+json',
+        'Authorization': `Bearer ${accessToken}`,
+        ...NEXAR_HEADERS,
       },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, application/graphql-response+json',
-          Authorization: `Bearer ${accessToken}`,
-          ...NEXAR_HEADERS,
-        },
-        httpsAgent,
-        timeout: 12000,
-      }
-    );
+      body: gqlBody,
+      cache: 'no-store',
+    });
 
-    const jsonData = gqlRes.data;
-
-    if (jsonData.errors && jsonData.errors.length > 0) {
+    const gqlText = await gqlRes.text();
+    if (!gqlRes.ok) {
       return NextResponse.json(
-        { error: jsonData.errors[0].message },
+        { error: `GraphQL Endpoint Error (${gqlRes.status}): ${gqlText.slice(0, 500)}` },
+        { status: gqlRes.status }
+      );
+    }
+
+    let gqlData: {
+      errors?: Array<{ message: string }>;
+      data?: {
+        supSearch?: {
+          results?: Array<{
+            part: {
+              mpn: string;
+              name: string | null;
+              shortDescription: string | null;
+              bestDatasheet: { url: string } | null;
+              sellers: Array<{
+                company: { name: string } | null;
+                offers: Array<{
+                  clickUrl: string | null;
+                  prices: Array<{ price: number; currency: string }> | null;
+                }> | null;
+              }> | null;
+            };
+          }>;
+        };
+      };
+    };
+    try {
+      gqlData = JSON.parse(gqlText);
+    } catch {
+      return NextResponse.json(
+        { error: 'GraphQL response was not valid JSON.' },
+        { status: 500 }
+      );
+    }
+
+    if (gqlData.errors && gqlData.errors.length > 0) {
+      return NextResponse.json(
+        { error: gqlData.errors[0].message },
         { status: 400 }
       );
     }
 
     // Transform results into the shape the UI expects
-    const rawResults = jsonData.data?.supSearch?.results || [];
+    const rawResults = gqlData.data?.supSearch?.results || [];
 
-    const parts = rawResults.map((r: { part: {
-      mpn: string;
-      name: string | null;
-      shortDescription: string | null;
-      bestDatasheet: { url: string } | null;
-      sellers: Array<{
-        company: { name: string } | null;
-        offers: Array<{
-          clickUrl: string | null;
-          prices: Array<{ price: number; currency: string }> | null;
-        }> | null;
-      }> | null;
-    }}) => {
+    const parts = rawResults.map((r) => {
       const part = r.part;
       const sellers = part.sellers || [];
       const offers = sellers.flatMap((s) =>
@@ -157,7 +195,7 @@ export async function GET(req: NextRequest) {
         }))
       );
 
-      const firstOffer = offers.find((o: { price: number | null }) => o.price !== null);
+      const firstOffer = offers.find((o) => o.price !== null);
 
       return {
         id: part.mpn,
@@ -174,7 +212,7 @@ export async function GET(req: NextRequest) {
         offers,
         specs: {},
         quality_score: 5,
-        stock_status: offers.some((o: { price: number | null }) => o.price !== null) ? 'in_stock' : 'unknown',
+        stock_status: offers.some((o) => o.price !== null) ? 'in_stock' : 'unknown',
       };
     });
 
@@ -185,17 +223,6 @@ export async function GET(req: NextRequest) {
       hasMore: false,
     });
   } catch (err: unknown) {
-    if (axios.isAxiosError(err)) {
-      const errMsg = err.response?.data
-        ? typeof err.response.data === 'string'
-          ? err.response.data.slice(0, 500)
-          : JSON.stringify(err.response.data)
-        : err.message;
-      return NextResponse.json(
-        { error: `Nexar Request Failed: ${errMsg}` },
-        { status: err.response?.status || 500 }
-      );
-    }
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
       { error: `Nexar Request Failed: ${msg}` },
