@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
+import https from 'https';
 
 export const runtime = 'nodejs';
+
+const httpsAgent = new https.Agent({ keepAlive: false });
+
+const NEXAR_HEADERS = {
+  'Connection': 'close',
+  'User-Agent': 'FPVConfigurator/1.0',
+};
 
 const NEXAR_API_URL = 'https://api.nexar.com/graphql';
 const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
@@ -58,7 +66,11 @@ export async function GET(req: NextRequest) {
     });
 
     const tokenRes = await axios.post(NEXAR_TOKEN_URL, tokenParams.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...NEXAR_HEADERS,
+      },
+      httpsAgent,
       timeout: 12000,
     });
 
@@ -101,7 +113,9 @@ export async function GET(req: NextRequest) {
           'Content-Type': 'application/json',
           Accept: 'application/json, application/graphql-response+json',
           Authorization: `Bearer ${accessToken}`,
+          ...NEXAR_HEADERS,
         },
+        httpsAgent,
         timeout: 12000,
       }
     );
