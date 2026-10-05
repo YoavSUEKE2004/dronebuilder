@@ -3,12 +3,6 @@ import { NextRequest, NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 
 const NEXAR_API_URL = 'https://api.nexar.com/graphql';
-const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
-
-const NEXAR_HEADERS = {
-  'Connection': 'close',
-  'User-Agent': 'FPVConfigurator/1.0',
-};
 
 const DEFAULT_QUERIES: Record<string, string> = {
   frame: 'FPV frame',
@@ -42,98 +36,53 @@ export async function GET(req: NextRequest) {
 
   const searchTerm = query || getDefaultQuery(category);
 
-  const clientId = (process.env.NEXAR_CLIENT_ID || '').trim();
-  const clientSecret = (process.env.NEXAR_CLIENT_SECRET || '').trim();
+  const token = (process.env.NEXAR_TOKEN || '').trim();
 
-  if (!clientId || !clientSecret) {
+  if (!token) {
     return NextResponse.json(
-      { error: 'NEXAR_CLIENT_ID or NEXAR_CLIENT_SECRET is missing in environment variables.' },
+      { error: 'NEXAR_TOKEN is missing in .env environment variables.' },
       { status: 400 }
     );
   }
 
   try {
-    // --- Step 1: Fetch OAuth access token via native fetch ---
-    const tokenParams = new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: clientId,
-      client_secret: clientSecret,
-    });
-
-    const tokenRes = await fetch(NEXAR_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        ...NEXAR_HEADERS,
-      },
-      body: tokenParams.toString(),
-      cache: 'no-store',
-    });
-
-    const tokenText = await tokenRes.text();
-    if (!tokenRes.ok) {
-      return NextResponse.json(
-        { error: `OAuth Token Error (${tokenRes.status}): ${tokenText.slice(0, 500)}` },
-        { status: tokenRes.status }
-      );
-    }
-
-    let tokenData: { access_token?: string };
-    try {
-      tokenData = JSON.parse(tokenText);
-    } catch {
-      return NextResponse.json(
-        { error: 'OAuth token response was not valid JSON.' },
-        { status: 500 }
-      );
-    }
-
-    const accessToken = tokenData.access_token;
-    if (!accessToken) {
-      return NextResponse.json(
-        { error: 'No access token returned from Nexar identity endpoint.' },
-        { status: 500 }
-      );
-    }
-
-    // --- Step 2: Fetch GraphQL data via native fetch ---
-    const gqlBody = JSON.stringify({
-      query: `
-        query SearchParts($q: String!) {
-          supSearch(q: $q, limit: 10) {
-            results {
-              part {
-                mpn
-                name
-                shortDescription
-                bestDatasheet { url }
-                sellers {
-                  company { name }
-                  offers {
-                    clickUrl
-                    prices { price currency }
-                  }
-                }
-              }
-            }
-          }
-        }`,
-      variables: { q: searchTerm || 'FPV' },
-    });
-
     const gqlRes = await fetch(NEXAR_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json, application/graphql-response+json',
-        'Authorization': `Bearer ${accessToken}`,
-        ...NEXAR_HEADERS,
+        'Authorization': `Bearer ${token}`,
+        'Connection': 'close',
+        'User-Agent': 'FPVConfigurator/1.0',
       },
-      body: gqlBody,
+      body: JSON.stringify({
+        query: `
+          query SearchParts($q: String!) {
+            supSearch(q: $q, limit: 10) {
+              results {
+                part {
+                  mpn
+                  name
+                  shortDescription
+                  bestDatasheet { url }
+                  sellers {
+                    company { name }
+                    offers {
+                      clickUrl
+                      prices { price currency }
+                    }
+                  }
+                }
+              }
+            }
+          }`,
+        variables: { q: searchTerm || 'FPV' },
+      }),
       cache: 'no-store',
     });
 
     const gqlText = await gqlRes.text();
+
     if (!gqlRes.ok) {
       return NextResponse.json(
         { error: `GraphQL Endpoint Error (${gqlRes.status}): ${gqlText.slice(0, 500)}` },
@@ -179,7 +128,6 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Transform results into the shape the UI expects
     const rawResults = gqlData.data?.supSearch?.results || [];
 
     const parts = rawResults.map((r) => {
