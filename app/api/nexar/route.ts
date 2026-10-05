@@ -4,6 +4,7 @@ export const runtime = 'nodejs';
 
 const NEXAR_API_URL = 'https://api.nexar.com/graphql';
 const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
+const FETCH_TIMEOUT_MS = 10000;
 
 const DEFAULT_QUERIES: Record<string, string> = {
   frame: 'FPV frame',
@@ -82,6 +83,12 @@ type NexarPartResponse = {
 
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
+function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timeout));
+}
+
 async function getNexarToken(): Promise<string> {
   const clientId = process.env.NEXAR_CLIENT_ID;
   const clientSecret = process.env.NEXAR_CLIENT_SECRET;
@@ -108,11 +115,22 @@ async function getNexarToken(): Promise<string> {
 
   console.log('[Nexar Proxy] Requesting OAuth token from', NEXAR_TOKEN_URL);
 
-  const tokenResponse = await fetch(NEXAR_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
+  let tokenResponse: Response;
+  try {
+    tokenResponse = await fetchWithTimeout(
+      NEXAR_TOKEN_URL,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      },
+      FETCH_TIMEOUT_MS
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown network error';
+    console.error('[Nexar Proxy] Token fetch network/timeout error:', msg);
+    throw new Error(`OAuth token fetch failed (network/timeout after ${FETCH_TIMEOUT_MS}ms): ${msg}`);
+  }
 
   const tokenContentType = tokenResponse.headers.get('content-type') || '';
 
@@ -127,7 +145,6 @@ async function getNexarToken(): Promise<string> {
         errorDetail = errorText.slice(0, 500);
       }
     } else {
-      // HTML error page (e.g. Cloudflare 530) — don't try to parse as JSON
       errorDetail = `Non-JSON response (${tokenContentType || 'unknown content-type'}). Status: ${tokenResponse.statusText}`;
     }
     console.error(`[Nexar Proxy] OAuth token fetch failed [${tokenResponse.status}]:`, errorDetail);
@@ -136,7 +153,6 @@ async function getNexarToken(): Promise<string> {
     );
   }
 
-  // Guard against HTML error pages being parsed as JSON
   if (!tokenContentType.includes('application/json')) {
     const bodyPreview = await tokenResponse.text().catch(() => '<unreadable>');
     console.error(`[Nexar Proxy] Token endpoint returned non-JSON content-type: ${tokenContentType}`);
@@ -170,7 +186,6 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const query = searchParams.get('q') || '';
     const category = searchParams.get('category') || '';
-    const limit = Math.min(parseInt(searchParams.get('limit') || '10', 10), 50);
 
     if (!query && !category) {
       return NextResponse.json(
@@ -181,7 +196,7 @@ export async function GET(req: NextRequest) {
 
     const searchTerm = query || getDefaultQuery(category);
 
-    // Step 1: OAuth 2.0 token retrieval
+    // Step 1: OAuth 2.0 token retrieval (with 10s timeout)
     let token: string;
     try {
       token = await getNexarToken();
@@ -194,7 +209,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Step 2: GraphQL query
+    // Step 2: GraphQL query (with 10s timeout)
     const gqlQuery = `
       query SearchParts($term: String!) {
         supSearch(q: $term, limit: 10) {
@@ -230,19 +245,24 @@ export async function GET(req: NextRequest) {
 
     let res: Response;
     try {
-      res = await fetch(NEXAR_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      res = await fetchWithTimeout(
+        NEXAR_API_URL,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: payload,
         },
-        body: payload,
-      });
+        FETCH_TIMEOUT_MS
+      );
     } catch (fetchErr) {
+      const isAbort = fetchErr instanceof Error && fetchErr.name === 'AbortError';
       const msg = fetchErr instanceof Error ? fetchErr.message : 'Network error';
-      console.error('[Nexar Proxy] Network error fetching GraphQL:', msg);
+      console.error(`[Nexar Proxy] ${isAbort ? 'GraphQL fetch timed out' : 'Network error'} after ${FETCH_TIMEOUT_MS}ms:`, msg);
       return NextResponse.json(
-        { error: `Nexar Error: [CORS / Network Error] ${msg}`, parts: [], count: 0 },
+        { error: `Nexar Error: [${isAbort ? 'Timeout' : 'CORS / Network Error'}] ${msg}`, parts: [], count: 0 },
         { status: 500 }
       );
     }
