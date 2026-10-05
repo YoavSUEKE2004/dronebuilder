@@ -8,7 +8,29 @@ const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
 const CACHE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ============================================================
-// SUPABASE SERVER CLIENT (service role for upserts)
+// DEFAULT BROAD QUERIES PER CATEGORY
+// ============================================================
+
+const DEFAULT_QUERIES: Record<string, string> = {
+  frame: '5 inch FPV frame',
+  motor: '2207 brushless motor FPV',
+  esc: '4in1 ESC BLHeli',
+  flight_controller: 'F7 flight controller FPV',
+  propeller: '5 inch FPV propeller',
+  battery: 'FPV lipo battery 4S 6S',
+  camera: 'FPV camera analog digital',
+  vtx: 'FPV VTX 5.8GHz',
+  receiver: 'ELRS receiver FPV',
+  goggles: 'FPV goggles 5.8GHz',
+  remote: 'FPV radio controller',
+};
+
+function getDefaultQuery(category: string): string {
+  return DEFAULT_QUERIES[category] || category;
+}
+
+// ============================================================
+// SUPABASE SERVER CLIENT
 // ============================================================
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -156,11 +178,13 @@ async function getNexarToken(): Promise<string> {
 async function getCachedParts(
   searchTerm: string,
   category: string,
-  freshOnly: boolean
-): Promise<{ parts: CachedNexarPart[]; isStale: boolean }> {
+  freshOnly: boolean,
+  offset: number,
+  limit: number
+): Promise<{ parts: CachedNexarPart[]; isStale: boolean; totalInCategory: number }> {
   let query = supabaseServer
     .from('cached_nexar_parts')
-    .select('*');
+    .select('*', { count: 'exact' });
 
   if (category) {
     query = query.eq('category', category);
@@ -169,10 +193,17 @@ async function getCachedParts(
     query = query.or(`search_term.ilike.%${searchTerm}%,mpn.ilike.%${searchTerm}%,name.ilike.%${searchTerm}%`);
   }
 
-  const { data, error } = await query.order('updated_at', { ascending: false }).limit(50);
+  const { data, error, count } = await query
+    .order('updated_at', { ascending: false })
+    .range(offset, offset + limit - 1);
 
   if (error || !data || data.length === 0) {
-    return { parts: [], isStale: false };
+    // Check if any rows exist in this category at all (for fallback)
+    const { count: categoryCount } = await supabaseServer
+      .from('cached_nexar_parts')
+      .select('*', { count: 'exact', head: true })
+      .eq('category', category);
+    return { parts: [], isStale: false, totalInCategory: categoryCount || 0 };
   }
 
   const cachedRows = data as CachedNexarPart[];
@@ -183,11 +214,10 @@ async function getCachedParts(
   );
 
   if (fresh.length > 0) {
-    return { parts: fresh, isStale: false };
+    return { parts: fresh, isStale: false, totalInCategory: count || 0 };
   }
 
-  // No fresh data — return stale if we're allowed to
-  return { parts: freshOnly ? [] : cachedRows, isStale: cachedRows.length > 0 };
+  return { parts: freshOnly ? [] : cachedRows, isStale: cachedRows.length > 0, totalInCategory: count || 0 };
 }
 
 // ============================================================
@@ -224,12 +254,12 @@ async function upsertCachedParts(
     .upsert(rows, { onConflict: 'mpn,category' });
 
   if (error) {
-    // Non-fatal — cache write failure shouldn't break the response
+    // Non-fatal
   }
 }
 
 // ============================================================
-// NEXAR FETCH — returns empty array on failure, never throws
+// NEXAR FETCH
 // ============================================================
 
 async function fetchNexarParts(
@@ -346,6 +376,22 @@ function cacheRowToPart(row: CachedNexarPart, source: 'cache' | 'stale-cache'): 
 }
 
 // ============================================================
+// FALLBACK: get any cached parts in a category (ignore search term)
+// ============================================================
+
+async function getAnyCategoryParts(category: string, limit: number): Promise<NormalizedPart[]> {
+  const { data, error } = await supabaseServer
+    .from('cached_nexar_parts')
+    .select('*')
+    .eq('category', category)
+    .order('updated_at', { ascending: false })
+    .limit(limit);
+
+  if (error || !data) return [];
+  return (data as CachedNexarPart[]).map((row) => cacheRowToPart(row, 'stale-cache'));
+}
+
+// ============================================================
 // ROUTE HANDLER
 // ============================================================
 
@@ -354,6 +400,7 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const query = searchParams.get('q') || searchParams.get('query') || '';
     const category = searchParams.get('category') || '';
+    const offset = parseInt(searchParams.get('offset') || '0', 10);
     const limit = Math.min(parseInt(searchParams.get('limit') || '20', 10), 50);
 
     if (!query && !category) {
@@ -363,47 +410,82 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const searchTerm = query || category;
+    // Use default broad query if only category is provided
+    const searchTerm = query || getDefaultQuery(category);
 
-    // 1. Check Supabase cache first — fresh data (within 7 days)
-    const { parts: freshCached, isStale } = await getCachedParts(searchTerm, category, true);
+    // 1. Check Supabase cache first — fresh data
+    const { parts: freshCached, isStale, totalInCategory } = await getCachedParts(searchTerm, category, true, offset, limit);
 
     if (freshCached.length > 0) {
       const parts = freshCached.slice(0, limit).map((row) => cacheRowToPart(row, 'cache'));
-      return NextResponse.json({ parts, count: parts.length, source: 'cache' });
+      return NextResponse.json({
+        parts,
+        count: parts.length,
+        source: 'cache',
+        offset,
+        limit,
+        hasMore: totalInCategory > offset + limit,
+      });
     }
 
     // 2. No fresh cache — call Nexar live
     const nexarParts = await fetchNexarParts(searchTerm, category, limit);
 
     if (nexarParts.length > 0) {
-      // 3. Upsert results into Supabase cache for future queries
       await upsertCachedParts(nexarParts, searchTerm);
-
       const parts = nexarParts.slice(0, limit);
-      return NextResponse.json({ parts, count: parts.length, source: 'nexar' });
+      return NextResponse.json({
+        parts,
+        count: parts.length,
+        source: 'nexar',
+        offset,
+        limit,
+        hasMore: parts.length === limit,
+      });
     }
 
-    // 4. Nexar returned nothing or failed — fall back to stale cache
+    // 3. Nexar failed — try stale cache for this search
     if (isStale) {
-      const { parts: staleParts } = await getCachedParts(searchTerm, category, false);
+      const { parts: staleParts } = await getCachedParts(searchTerm, category, false, offset, limit);
       if (staleParts.length > 0) {
         const parts = staleParts.slice(0, limit).map((row) => cacheRowToPart(row, 'stale-cache'));
         return NextResponse.json({
           parts,
           count: parts.length,
           source: 'stale-cache',
-          warning: 'Live data unavailable, showing cached results from a previous fetch',
+          warning: 'Live data unavailable, showing cached results',
+          offset,
+          limit,
+          hasMore: false,
         });
       }
     }
 
-    // 5. No data anywhere — return empty, no error
+    // 4. Last resort — return any parts cached in this category regardless of search term
+    if (category) {
+      const fallbackParts = await getAnyCategoryParts(category, limit);
+      if (fallbackParts.length > 0) {
+        return NextResponse.json({
+          parts: fallbackParts,
+          count: fallbackParts.length,
+          source: 'stale-cache',
+          warning: 'No exact match found, showing other cached parts in this category',
+          offset: 0,
+          limit,
+          hasMore: false,
+        });
+      }
+    }
+
+    // 5. Nothing at all
     return NextResponse.json({
       parts: [],
       count: 0,
       source: 'empty',
-      warning: 'No parts found. Check your search term or try a different category.',
+      warning: 'No parts found. Try a different search term.',
+      offset,
+      limit,
+      hasMore: false,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to fetch parts';
