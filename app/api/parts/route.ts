@@ -1,39 +1,52 @@
 import { NextRequest, NextResponse } from 'next/server';
-import localParts from '@/lib/parts.json';
+import { createClient } from '@supabase/supabase-js';
 
 export const runtime = 'nodejs';
 
 const NEXAR_API_URL = 'https://api.nexar.com/graphql';
 const NEXAR_TOKEN_URL = 'https://identity.nexar.com/connect/token';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// ============================================================
+// SUPABASE SERVER CLIENT (service role for upserts)
+// ============================================================
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+const supabaseServer = createClient(supabaseUrl!, supabaseServiceKey!, {
+  auth: { persistSession: false },
+});
 
 // ============================================================
 // TYPES
 // ============================================================
 
-type LocalPart = {
+type CachedNexarPart = {
   id: string;
-  name: string;
-  category: string;
-  brand: string;
   mpn: string;
-  price: number;
-  store_name: string;
-  product_url: string;
-  image_url: string;
-  dimensions_mm: string;
-  mounting_pattern: string;
-  weight_g: number;
-  shipping_days: number;
-  shipping_cost: number;
+  category: string;
+  search_term: string | null;
+  name: string;
+  manufacturer: string | null;
+  description: string | null;
+  brand: string | null;
+  image_url: string | null;
+  datasheet_url: string | null;
+  price: number | null;
+  currency: string;
+  specs: Record<string, unknown>;
+  offers: Array<{
+    seller: string;
+    url: string;
+    inStock: number | null;
+    price: number | null;
+    currency: string;
+  }>;
   quality_score: number;
-  electrical_specs: {
-    max_voltage_s: number | null;
-    min_voltage_s: number | null;
-    max_current_a: number | null;
-    bec_output_v: number | null;
-    protocol: string;
-  };
+  stock_status: string;
+  updated_at: string;
+  created_at: string;
 };
 
 type NormalizedPart = {
@@ -47,7 +60,7 @@ type NormalizedPart = {
   category: string;
   price: number | null;
   currency: string;
-  source: 'local' | 'nexar' | 'merged';
+  source: 'cache' | 'nexar' | 'stale-cache';
   offers: Array<{
     seller: string;
     url: string;
@@ -55,6 +68,9 @@ type NormalizedPart = {
     price: number | null;
     currency: string;
   }>;
+  specs: Record<string, unknown>;
+  quality_score: number;
+  stock_status: string;
 };
 
 type NexarTokenResponse = {
@@ -89,31 +105,6 @@ type NexarPart = {
     prices: Array<{ price: number; currency: string; quantity: number }> | null;
   }>;
 };
-
-// ============================================================
-// IN-MEMORY CACHE — 24h TTL per search key
-// ============================================================
-
-type CacheEntry = {
-  parts: NormalizedPart[];
-  timestamp: number;
-};
-
-const responseCache = new Map<string, CacheEntry>();
-
-function getCached(key: string): NormalizedPart[] | null {
-  const entry = responseCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
-    responseCache.delete(key);
-    return null;
-  }
-  return entry.parts;
-}
-
-function setCached(key: string, parts: NormalizedPart[]) {
-  responseCache.set(key, { parts, timestamp: Date.now() });
-}
 
 // ============================================================
 // NEXAR AUTH
@@ -159,52 +150,93 @@ async function getNexarToken(): Promise<string> {
 }
 
 // ============================================================
-// LOCAL DATA HELPERS
+// SUPABASE CACHE LOOKUP
 // ============================================================
 
-const LOCAL_PARTS = localParts as LocalPart[];
+async function getCachedParts(
+  searchTerm: string,
+  category: string,
+  freshOnly: boolean
+): Promise<{ parts: CachedNexarPart[]; isStale: boolean }> {
+  let query = supabaseServer
+    .from('cached_nexar_parts')
+    .select('*');
 
-function searchLocalParts(query: string, category: string, limit: number): LocalPart[] {
-  const q = query.toLowerCase().trim();
-  return LOCAL_PARTS.filter((p) => {
-    if (category && p.category !== category) return false;
-    if (!q) return true;
-    return (
-      p.name.toLowerCase().includes(q) ||
-      p.brand.toLowerCase().includes(q) ||
-      p.mpn.toLowerCase().includes(q)
-    );
-  }).slice(0, limit);
+  if (category) {
+    query = query.eq('category', category);
+  }
+  if (searchTerm) {
+    query = query.or(`search_term.ilike.%${searchTerm}%,mpn.ilike.%${searchTerm}%,name.ilike.%${searchTerm}%`);
+  }
+
+  const { data, error } = await query.order('updated_at', { ascending: false }).limit(50);
+
+  if (error || !data || data.length === 0) {
+    return { parts: [], isStale: false };
+  }
+
+  const cachedRows = data as CachedNexarPart[];
+  const staleCutoff = Date.now() - CACHE_STALE_MS;
+
+  const fresh = cachedRows.filter(
+    (row) => new Date(row.updated_at).getTime() > staleCutoff
+  );
+
+  if (fresh.length > 0) {
+    return { parts: fresh, isStale: false };
+  }
+
+  // No fresh data — return stale if we're allowed to
+  return { parts: freshOnly ? [] : cachedRows, isStale: cachedRows.length > 0 };
 }
 
-function normalizeLocalPart(p: LocalPart): NormalizedPart {
-  return {
-    id: p.id,
-    name: p.name,
-    manufacturer: p.brand,
+// ============================================================
+// UPSERT TO SUPABASE
+// ============================================================
+
+async function upsertCachedParts(
+  parts: NormalizedPart[],
+  searchTerm: string
+): Promise<void> {
+  if (parts.length === 0) return;
+
+  const rows = parts.map((p) => ({
     mpn: p.mpn,
-    description: null,
-    datasheetUrl: null,
-    image_url: p.image_url || null,
-    category: p.category,
+    category: p.category || 'unknown',
+    search_term: searchTerm,
+    name: p.name,
+    manufacturer: p.manufacturer,
+    description: p.description,
+    brand: p.manufacturer,
+    image_url: p.image_url,
+    datasheet_url: p.datasheetUrl,
     price: p.price,
-    currency: 'USD',
-    source: 'local',
-    offers: [{
-      seller: p.store_name,
-      url: p.product_url,
-      inStock: null,
-      price: p.price,
-      currency: 'USD',
-    }],
-  };
+    currency: p.currency,
+    specs: p.specs || {},
+    offers: p.offers || [],
+    quality_score: p.quality_score,
+    stock_status: p.stock_status,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabaseServer
+    .from('cached_nexar_parts')
+    .upsert(rows, { onConflict: 'mpn,category' });
+
+  if (error) {
+    // Non-fatal — cache write failure shouldn't break the response
+  }
 }
 
 // ============================================================
 // NEXAR FETCH — returns empty array on failure, never throws
 // ============================================================
 
-async function fetchNexarParts(searchTerm: string, limit: number): Promise<NormalizedPart[]> {
+async function fetchNexarParts(
+  searchTerm: string,
+  category: string,
+  limit: number
+): Promise<NormalizedPart[]> {
   try {
     const token = await getNexarToken();
 
@@ -255,6 +287,17 @@ async function fetchNexarParts(searchTerm: string, limit: number): Promise<Norma
 
     return hits.map((hit) => {
       const part = hit.part;
+      const offers = (part.offers || []).map((offer) => ({
+        seller: offer.seller?.name || '',
+        url: offer.url,
+        inStock: offer.inventory ?? null,
+        price: offer.prices?.[0]?.price ?? null,
+        currency: offer.prices?.[0]?.currency || 'USD',
+      }));
+
+      const totalStock = offers.reduce((sum, o) => sum + (o.inStock ?? 0), 0);
+      const stockStatus = totalStock > 10 ? 'in_stock' : totalStock > 0 ? 'low_stock' : 'unknown';
+
       return {
         id: part.id,
         name: part.name,
@@ -263,17 +306,14 @@ async function fetchNexarParts(searchTerm: string, limit: number): Promise<Norma
         description: part.description,
         datasheetUrl: part.datasheetUrl,
         image_url: part.bestImage?.url || null,
-        category: '',
+        category: category || '',
         price: part.medianPrice?.price ?? null,
         currency: part.medianPrice?.currency || 'USD',
         source: 'nexar' as const,
-        offers: (part.offers || []).map((offer) => ({
-          seller: offer.seller?.name || '',
-          url: offer.url,
-          inStock: offer.inventory ?? null,
-          price: offer.prices?.[0]?.price ?? null,
-          currency: offer.prices?.[0]?.currency || 'USD',
-        })),
+        offers,
+        specs: {},
+        quality_score: 5,
+        stock_status: stockStatus,
       };
     });
   } catch {
@@ -282,42 +322,27 @@ async function fetchNexarParts(searchTerm: string, limit: number): Promise<Norma
 }
 
 // ============================================================
-// MERGE LOGIC — local parts first, Nexar enriches with live pricing
+// CONVERT CACHE ROW → NORMALIZED PART
 // ============================================================
 
-function mergeParts(local: NormalizedPart[], nexar: NormalizedPart[]): NormalizedPart[] {
-  const merged: NormalizedPart[] = [];
-  const seenMpn = new Set<string>();
-
-  for (const lp of local) {
-    const nexarMatch = nexar.find((np) =>
-      np.mpn && lp.mpn && np.mpn.toLowerCase() === lp.mpn.toLowerCase()
-    );
-
-    if (nexarMatch && nexarMatch.price !== null) {
-      merged.push({
-        ...lp,
-        price: nexarMatch.price,
-        currency: nexarMatch.currency,
-        source: 'merged',
-        offers: nexarMatch.offers.length > 0 ? nexarMatch.offers : lp.offers,
-        description: nexarMatch.description,
-        datasheetUrl: nexarMatch.datasheetUrl,
-        image_url: nexarMatch.image_url || lp.image_url,
-      });
-    } else {
-      merged.push(lp);
-    }
-
-    if (lp.mpn) seenMpn.add(lp.mpn.toLowerCase());
-  }
-
-  for (const np of nexar) {
-    if (np.mpn && seenMpn.has(np.mpn.toLowerCase())) continue;
-    merged.push(np);
-  }
-
-  return merged;
+function cacheRowToPart(row: CachedNexarPart, source: 'cache' | 'stale-cache'): NormalizedPart {
+  return {
+    id: row.id,
+    name: row.name,
+    manufacturer: row.manufacturer || row.brand || '',
+    mpn: row.mpn,
+    description: row.description,
+    datasheetUrl: row.datasheet_url,
+    image_url: row.image_url,
+    category: row.category,
+    price: row.price !== null ? Number(row.price) : null,
+    currency: row.currency || 'USD',
+    source,
+    offers: row.offers || [],
+    specs: row.specs || {},
+    quality_score: row.quality_score || 5,
+    stock_status: row.stock_status || 'unknown',
+  };
 }
 
 // ============================================================
@@ -329,54 +354,57 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const query = searchParams.get('q') || searchParams.get('query') || '';
     const category = searchParams.get('category') || '';
-    const live = searchParams.get('live') === '1' || searchParams.get('live') === 'true';
     const limit = Math.min(parseInt(searchParams.get('limit') || '20', 10), 50);
 
     if (!query && !category) {
       return NextResponse.json(
-        { error: 'Provide a search query via the "q" parameter' },
+        { error: 'Provide a search query via the "q" or "category" parameter' },
         { status: 400 }
       );
     }
 
     const searchTerm = query || category;
-    const cacheKey = `${searchTerm.toLowerCase()}|${category.toLowerCase()}|${limit}|${live}`;
 
-    // 1. Check in-memory cache first
-    const cached = getCached(cacheKey);
-    if (cached) {
-      return NextResponse.json({ parts: cached, count: cached.length, source: 'cache' });
+    // 1. Check Supabase cache first — fresh data (within 7 days)
+    const { parts: freshCached, isStale } = await getCachedParts(searchTerm, category, true);
+
+    if (freshCached.length > 0) {
+      const parts = freshCached.slice(0, limit).map((row) => cacheRowToPart(row, 'cache'));
+      return NextResponse.json({ parts, count: parts.length, source: 'cache' });
     }
 
-    // 2. Always check local data first
-    const localResults = searchLocalParts(query, category, limit);
-    const localNormalized = localResults.map(normalizeLocalPart);
+    // 2. No fresh cache — call Nexar live
+    const nexarParts = await fetchNexarParts(searchTerm, category, limit);
 
-    // 3. If live pricing is not requested, return local data immediately
-    if (!live) {
-      setCached(cacheKey, localNormalized);
-      return NextResponse.json({ parts: localNormalized, count: localNormalized.length, source: 'local' });
+    if (nexarParts.length > 0) {
+      // 3. Upsert results into Supabase cache for future queries
+      await upsertCachedParts(nexarParts, searchTerm);
+
+      const parts = nexarParts.slice(0, limit);
+      return NextResponse.json({ parts, count: parts.length, source: 'nexar' });
     }
 
-    // 4. Fetch from Nexar (cached or fresh), gracefully fall back on failure
-    const nexarResults = await fetchNexarParts(searchTerm, limit);
-
-    if (nexarResults.length === 0) {
-      // Nexar returned nothing or failed — fall back to local data
-      setCached(cacheKey, localNormalized);
-      return NextResponse.json({
-        parts: localNormalized,
-        count: localNormalized.length,
-        source: 'local-fallback',
-        warning: 'Live pricing unavailable, showing local catalog data',
-      });
+    // 4. Nexar returned nothing or failed — fall back to stale cache
+    if (isStale) {
+      const { parts: staleParts } = await getCachedParts(searchTerm, category, false);
+      if (staleParts.length > 0) {
+        const parts = staleParts.slice(0, limit).map((row) => cacheRowToPart(row, 'stale-cache'));
+        return NextResponse.json({
+          parts,
+          count: parts.length,
+          source: 'stale-cache',
+          warning: 'Live data unavailable, showing cached results from a previous fetch',
+        });
+      }
     }
 
-    // 5. Merge: local parts enriched with live Nexar pricing, plus any Nexar-only results
-    const merged = mergeParts(localNormalized, nexarResults).slice(0, limit);
-    setCached(cacheKey, merged);
-
-    return NextResponse.json({ parts: merged, count: merged.length, source: 'merged' });
+    // 5. No data anywhere — return empty, no error
+    return NextResponse.json({
+      parts: [],
+      count: 0,
+      source: 'empty',
+      warning: 'No parts found. Check your search term or try a different category.',
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to fetch parts';
     return NextResponse.json({ error: message }, { status: 500 });

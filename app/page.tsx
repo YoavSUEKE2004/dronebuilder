@@ -23,6 +23,30 @@ const Drone3DCanvas = dynamic(() => import('@/components/drone-3d-canvas'), {
   ),
 });
 
+type NormalizedApiPart = {
+  id: string;
+  name: string;
+  manufacturer: string;
+  mpn: string;
+  description: string | null;
+  datasheetUrl: string | null;
+  image_url: string | null;
+  category: string;
+  price: number | null;
+  currency: string;
+  source: string;
+  offers: Array<{
+    seller: string;
+    url: string;
+    inStock: number | null;
+    price: number | null;
+    currency: string;
+  }>;
+  specs: Record<string, unknown>;
+  quality_score: number;
+  stock_status: string;
+};
+
 const CATEGORIES = [
   { key: 'goggles', label: 'Goggles' },
   { key: 'remote', label: 'Remote' },
@@ -55,13 +79,58 @@ export default function Home() {
   const loadData = useCallback(async () => {
     if (dataLoaded || loadingData) return;
     setLoadingData(true);
-    const [compRes, builderRes] = await Promise.all([
-      supabase.from('components').select('*, electrical_specs(*)').order('category', { ascending: true }).order('price', { ascending: false }),
-      supabase.from('builders').select('*').order('rating', { ascending: false }),
-    ]);
-    if (compRes.data) setComponents(compRes.data as ComponentWithSpecs[]);
-    if (builderRes.data) setBuilders(builderRes.data as Builder[]);
-    setDataLoaded(true);
+
+    const CATEGORIES_TO_FETCH = [
+      'frame', 'motor', 'esc', 'flight_controller',
+      'propeller', 'battery', 'camera', 'vtx', 'receiver',
+    ];
+
+    try {
+      const [partsResponses, builderRes] = await Promise.all([
+        Promise.all(
+          CATEGORIES_TO_FETCH.map((cat) =>
+            fetch(`/api/parts?category=${cat}&limit=20`).then((r) => r.json()).catch(() => ({ parts: [] }))
+          )
+        ),
+        supabase.from('builders').select('*').order('rating', { ascending: false }),
+      ]);
+
+      const allParts = partsResponses.flatMap((r: { parts?: NormalizedApiPart[] }) => r.parts || []);
+
+      const mapped: ComponentWithSpecs[] = allParts.map((p) => {
+        const specs = (p.specs || {}) as Record<string, unknown>;
+        return {
+          id: p.id,
+          name: p.name,
+          category: p.category,
+          price: p.price ?? 0,
+          store_name: p.offers?.[0]?.seller || p.manufacturer || '',
+          product_url: p.offers?.[0]?.url || '',
+          image_url: p.image_url || '',
+          dimensions_mm: String(specs.dimensions_mm || ''),
+          mounting_pattern: String(specs.mounting_pattern || ''),
+          weight_g: Number(specs.weight_g) || 0,
+          shipping_days: Number(specs.shipping_days) || 0,
+          shipping_cost: Number(specs.shipping_cost) || 0,
+          quality_score: p.quality_score || 5,
+          created_at: new Date().toISOString(),
+          electrical_specs: {
+            component_id: p.id,
+            max_voltage_s: (specs.max_voltage_s as number) ?? null,
+            min_voltage_s: (specs.min_voltage_s as number) ?? null,
+            max_current_a: (specs.max_current_a as number) ?? null,
+            bec_output_v: (specs.bec_output_v as number) ?? null,
+            protocol: String(specs.protocol || ''),
+          },
+        };
+      });
+
+      setComponents(mapped);
+      if (builderRes.data) setBuilders(builderRes.data as Builder[]);
+      setDataLoaded(true);
+    } catch {
+      setDataLoaded(true);
+    }
     setLoadingData(false);
   }, [dataLoaded, loadingData]);
 
