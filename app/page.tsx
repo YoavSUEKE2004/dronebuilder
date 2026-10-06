@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import ComponentDrawer from '@/components/ui/ComponentDrawer';
+import ComponentDrawer from '@/components/ui/drawer';
 import { CanonicalPart } from '@/lib/catalog';
 
 export default function Configurator() {
