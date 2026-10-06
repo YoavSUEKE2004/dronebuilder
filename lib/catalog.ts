@@ -1,58 +1,24 @@
-import { createClient } from '@supabase/supabase-js';
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
-
-export interface CanonicalPart {
-  id: string;
-  name: string;
-  category: string;
-  brand: string;
-  mounting_pattern?: string;
-  voltage_range?: string;
-  kv_rating?: number;
-  mcu?: string;
-  continuous_current?: number;
-  image_url?: string;
-  vendor_listings: {
-    id: string;
-    title: string;
-    price: number;
-    in_stock: boolean;
-    product_url: string;
-  }[];
-}
-
+// lib/catalog.ts
 export async function getPartsByCategory(category: string): Promise<CanonicalPart[]> {
+  // 1. Fetch EVERYTHING from the table without filtering by category first
   const { data, error } = await supabase
     .from('canonical_parts')
-    .select(`
-      id,
-      name,
-      category,
-      brand,
-      mounting_pattern,
-      voltage_range,
-      kv_rating,
-      mcu,
-      continuous_current,
-      image_url,
-      vendor_listings (
-        id,
-        title,
-        price,
-        in_stock,
-        product_url
-      )
-    `)
-    .eq('category', category);
+    .select('*, vendor_listings(*)');
+
+  // 2. Print the raw results to your browser console
+  console.log('--- DB RESPONSE CHECK ---');
+  console.log('1. Requested category slug:', category);
+  console.log('2. Error from Supabase (if any):', error);
+  console.log('3. Raw rows returned from table:', data);
 
   if (error) {
-    console.error(`Error fetching ${category} parts:`, error);
+    console.error('Error fetching parts:', error);
     return [];
   }
 
-  return data || [];
+  // 3. Filter manually in JS to see if category strings match
+  const filtered = (data || []).filter((item) => item.category === category);
+  console.log('4. Rows matching requested category:', filtered);
+
+  return filtered;
 }
