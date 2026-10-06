@@ -1,118 +1,115 @@
 'use client';
 
-import * as React from 'react';
-import { Drawer as DrawerPrimitive } from 'vaul';
+import { useEffect, useState } from 'react';
+import { getPartsByCategory, CanonicalPart } from '@/lib/catalog';
 
-import { cn } from '@/lib/utils';
+interface ComponentDrawerProps {
+  category: string;
+  isOpen: boolean;
+  onClose: () => void;
+  onSelectPart: (part: CanonicalPart) => void;
+}
 
-const Drawer = ({
-  shouldScaleBackground = true,
-  ...props
-}: React.ComponentProps<typeof DrawerPrimitive.Root>) => (
-  <DrawerPrimitive.Root
-    shouldScaleBackground={shouldScaleBackground}
-    {...props}
-  />
-);
-Drawer.displayName = 'Drawer';
+export default function ComponentDrawer({
+  category,
+  isOpen,
+  onClose,
+  onSelectPart,
+}: ComponentDrawerProps) {
+  const [parts, setParts] = useState<CanonicalPart[]>([]);
+  const [loading, setLoading] = useState(false);
 
-const DrawerTrigger = DrawerPrimitive.Trigger;
+  useEffect(() => {
+    if (isOpen && category) {
+      setLoading(true);
+      getPartsByCategory(category).then((data) => {
+        setParts(data);
+        setLoading(false);
+      });
+    }
+  }, [isOpen, category]);
 
-const DrawerPortal = DrawerPrimitive.Portal;
+  if (!isOpen) return null;
 
-const DrawerClose = DrawerPrimitive.Close;
+  return (
+    <div className="fixed inset-y-0 right-0 w-96 bg-zinc-900 border-l border-zinc-800 p-6 z-50 overflow-y-auto shadow-2xl text-white">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-xl font-bold capitalize">
+          Select {category.replace('_', ' ')}
+        </h2>
+        <button
+          onClick={onClose}
+          className="text-zinc-400 hover:text-white text-lg p-1"
+        >
+          ✕
+        </button>
+      </div>
 
-const DrawerOverlay = React.forwardRef<
-  React.ElementRef<typeof DrawerPrimitive.Overlay>,
-  React.ComponentPropsWithoutRef<typeof DrawerPrimitive.Overlay>
->(({ className, ...props }, ref) => (
-  <DrawerPrimitive.Overlay
-    ref={ref}
-    className={cn('fixed inset-0 z-50 bg-black/80', className)}
-    {...props}
-  />
-));
-DrawerOverlay.displayName = DrawerPrimitive.Overlay.displayName;
+      {loading ? (
+        <div className="text-center py-12 text-zinc-400">
+          Loading catalog from Supabase...
+        </div>
+      ) : parts.length === 0 ? (
+        <div className="text-center py-12 text-zinc-500">
+          No components found for this category.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {parts.map((part) => {
+            const lowestPrice = part.vendor_listings?.length
+              ? Math.min(...part.vendor_listings.map((v) => v.price))
+              : null;
 
-const DrawerContent = React.forwardRef<
-  React.ElementRef<typeof DrawerPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DrawerPrimitive.Content>
->(({ className, children, ...props }, ref) => (
-  <DrawerPortal>
-    <DrawerOverlay />
-    <DrawerPrimitive.Content
-      ref={ref}
-      className={cn(
-        'fixed inset-x-0 bottom-0 z-50 mt-24 flex h-auto flex-col rounded-t-[10px] border bg-background',
-        className
+            return (
+              <div
+                key={part.id}
+                onClick={() => onSelectPart(part)}
+                className="p-4 rounded-xl bg-zinc-800/60 border border-zinc-700/50 hover:border-blue-500 transition cursor-pointer"
+              >
+                <div className="font-semibold text-zinc-100">{part.name}</div>
+                <div className="text-xs text-zinc-400 mt-1">{part.brand}</div>
+
+                <div className="flex flex-wrap gap-1.5 mt-3">
+                  {part.mounting_pattern && (
+                    <span className="text-[10px] bg-zinc-700/80 px-2 py-0.5 rounded text-zinc-300">
+                      Mount: {part.mounting_pattern}
+                    </span>
+                  )}
+                  {part.voltage_range && (
+                    <span className="text-[10px] bg-zinc-700/80 px-2 py-0.5 rounded text-zinc-300">
+                      Voltage: {part.voltage_range}
+                    </span>
+                  )}
+                  {part.mcu && (
+                    <span className="text-[10px] bg-zinc-700/80 px-2 py-0.5 rounded text-zinc-300">
+                      MCU: {part.mcu}
+                    </span>
+                  )}
+                  {part.kv_rating && (
+                    <span className="text-[10px] bg-zinc-700/80 px-2 py-0.5 rounded text-zinc-300">
+                      {part.kv_rating} KV
+                    </span>
+                  )}
+                  {part.continuous_current && (
+                    <span className="text-[10px] bg-zinc-700/80 px-2 py-0.5 rounded text-zinc-300">
+                      {part.continuous_current}A ESC
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex justify-between items-center mt-4 pt-3 border-t border-zinc-700/40">
+                  <span className="text-xs text-zinc-400">
+                    {part.vendor_listings?.length || 0} seller(s) available
+                  </span>
+                  <span className="text-sm font-bold text-emerald-400">
+                    {lowestPrice ? `$${lowestPrice.toFixed(2)}` : 'Out of Stock'}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
-      {...props}
-    >
-      <div className="mx-auto mt-4 h-2 w-[100px] rounded-full bg-muted" />
-      {children}
-    </DrawerPrimitive.Content>
-  </DrawerPortal>
-));
-DrawerContent.displayName = 'DrawerContent';
-
-const DrawerHeader = ({
-  className,
-  ...props
-}: React.HTMLAttributes<HTMLDivElement>) => (
-  <div
-    className={cn('grid gap-1.5 p-4 text-center sm:text-left', className)}
-    {...props}
-  />
-);
-DrawerHeader.displayName = 'DrawerHeader';
-
-const DrawerFooter = ({
-  className,
-  ...props
-}: React.HTMLAttributes<HTMLDivElement>) => (
-  <div
-    className={cn('mt-auto flex flex-col gap-2 p-4', className)}
-    {...props}
-  />
-);
-DrawerFooter.displayName = 'DrawerFooter';
-
-const DrawerTitle = React.forwardRef<
-  React.ElementRef<typeof DrawerPrimitive.Title>,
-  React.ComponentPropsWithoutRef<typeof DrawerPrimitive.Title>
->(({ className, ...props }, ref) => (
-  <DrawerPrimitive.Title
-    ref={ref}
-    className={cn(
-      'text-lg font-semibold leading-none tracking-tight',
-      className
-    )}
-    {...props}
-  />
-));
-DrawerTitle.displayName = DrawerPrimitive.Title.displayName;
-
-const DrawerDescription = React.forwardRef<
-  React.ElementRef<typeof DrawerPrimitive.Description>,
-  React.ComponentPropsWithoutRef<typeof DrawerPrimitive.Description>
->(({ className, ...props }, ref) => (
-  <DrawerPrimitive.Description
-    ref={ref}
-    className={cn('text-sm text-muted-foreground', className)}
-    {...props}
-  />
-));
-DrawerDescription.displayName = DrawerPrimitive.Description.displayName;
-
-export {
-  Drawer,
-  DrawerPortal,
-  DrawerOverlay,
-  DrawerTrigger,
-  DrawerClose,
-  DrawerContent,
-  DrawerHeader,
-  DrawerFooter,
-  DrawerTitle,
-  DrawerDescription,
-};
+    </div>
+  );
+}
