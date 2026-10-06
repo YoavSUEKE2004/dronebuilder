@@ -20,14 +20,16 @@ export default function ComponentDrawer({
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (isOpen && category) {
-      setLoading(true);
-      getPartsByCategory(category).then((data) => {
-        setParts(data);
-        setLoading(false);
-      });
-    }
-  }, [isOpen, category]);
+  if (isOpen && category) {
+    setLoading(true);
+    console.log("Fetching category from Supabase:", category);
+    getPartsByCategory(category).then((data) => {
+      console.log("Supabase returned:", data);
+      setParts(data);
+      setLoading(false);
+    });
+  }
+}, [isOpen, category]);
 
   if (!isOpen) return null;
 
