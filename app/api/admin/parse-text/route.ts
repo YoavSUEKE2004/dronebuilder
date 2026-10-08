@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { GoogleGenAI, Type } from '@google/genai';
 
 export const runtime = 'nodejs';
+export const maxDuration = 60;
 
 type ParsedPart = {
   name: string;
@@ -40,6 +41,27 @@ const responseSchema = {
   required: ['name', 'brand', 'category'],
 };
 
+const MAX_RETRIES = 3;
+const INITIAL_DELAY_MS = 1000;
+
+function isNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes('fetch failed') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('etimedout') ||
+    msg.includes('socket hang up') ||
+    msg.includes('network') ||
+    msg.includes('aborted')
+  );
+}
+
+async function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { rawText } = await req.json();
@@ -59,36 +81,81 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const ai = new GoogleGenAI({ apiKey });
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { timeout: 45000 },
+    });
 
-    const systemInstruction = `You are an expert FPV drone component parser. Extract product specs from unformatted raw supplier web page text. Infer missing details where logical, but do not hallucinate numbers.`;
+    const systemInstruction =
+      'You are an expert FPV drone component parser. ' +
+      'Extract product specs from unformatted raw supplier web page text. ' +
+      'Infer missing details where logical, but do not hallucinate numbers.';
 
     const truncatedText = rawText.slice(0, 10000);
 
-    let parsed: ParsedPart;
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: truncatedText,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema,
-          temperature: 0.3,
-        },
-      });
+    let parsed: ParsedPart | null = null;
+    let lastError: Error | null = null;
 
-      const text = response.text;
-      if (!text) {
-        return NextResponse.json({ error: 'Gemini returned no content' }, { status: 500 });
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: truncatedText,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema,
+            temperature: 0.3,
+            abortSignal: AbortSignal.timeout(45000),
+          },
+        });
+
+        const text = response.text;
+        if (!text) {
+          return NextResponse.json(
+            { error: 'Gemini returned no content. The text may not contain recognizable product specs.' },
+            { status: 500 }
+          );
+        }
+
+        parsed = JSON.parse(text) as ParsedPart;
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+
+        if (isNetworkError(err) && attempt < MAX_RETRIES) {
+          const delay = INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
+          await sleep(delay);
+          continue;
+        }
+
+        // Non-retryable error or out of retries
+        if (isNetworkError(err)) {
+          return NextResponse.json(
+            {
+              error:
+                'Could not reach Google Gemini after ' +
+                MAX_RETRIES +
+                ' attempts. Check your network connection and try again.',
+            },
+            { status: 503 }
+          );
+        }
+
+        // API-level error (bad key, quota, malformed request, etc.)
+        const msg = err instanceof Error ? err.message : 'Gemini API error';
+        return NextResponse.json(
+          { error: `Gemini parsing failed: ${msg}` },
+          { status: 500 }
+        );
       }
+    }
 
-      parsed = JSON.parse(text) as ParsedPart;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Gemini API error';
+    if (!parsed) {
+      const msg = lastError?.message ?? 'Unknown error';
       return NextResponse.json(
-        { error: `Gemini parsing failed: ${msg}` },
-        { status: 500 }
+        { error: `Gemini parsing failed after ${MAX_RETRIES} retries: ${msg}` },
+        { status: 503 }
       );
     }
 
