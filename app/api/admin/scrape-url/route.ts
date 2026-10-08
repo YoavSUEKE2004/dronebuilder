@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { GoogleGenAI, Type } from '@google/genai';
 
 export const runtime = 'nodejs';
 
@@ -6,10 +7,10 @@ type ScrapedPart = {
   name: string;
   brand: string;
   category: string;
-  mounting_pattern: string;
-  voltage_range: string;
+  mounting_pattern: string | null;
+  voltage_range: string | null;
   continuous_current: number | null;
-  mcu: string;
+  mcu: string | null;
   weight_g: number | null;
   image_url: string;
   buy_price: number | null;
@@ -58,6 +59,27 @@ function extractImageUrls(html: string): string[] {
   return urls;
 }
 
+const responseSchema = {
+  type: Type.OBJECT,
+  properties: {
+    name: { type: Type.STRING, description: 'Clean, concise product title' },
+    brand: { type: Type.STRING, description: 'Manufacturer or brand name' },
+    category: {
+      type: Type.STRING,
+      description: 'One of: flight_controller, esc, motor, frame, vtx, camera, receiver, battery, propeller',
+      enum: VALID_CATEGORIES,
+    },
+    mounting_pattern: { type: Type.STRING, description: 'e.g. 30.5x30.5mm or 20x20mm', nullable: true },
+    voltage_range: { type: Type.STRING, description: 'e.g. 3S-6S or 4S-6S', nullable: true },
+    continuous_current: { type: Type.NUMBER, description: 'Max current in Amps', nullable: true },
+    mcu: { type: Type.STRING, description: 'MCU chip e.g. STM32F405, F722', nullable: true },
+    weight_g: { type: Type.NUMBER, description: 'Weight in grams', nullable: true },
+    image_url: { type: Type.STRING, description: 'Best primary product image URL from page candidates' },
+    buy_price: { type: Type.NUMBER, description: 'Listed supplier price in USD', nullable: true },
+  },
+  required: ['name', 'brand', 'category', 'image_url'],
+};
+
 export async function POST(req: NextRequest) {
   try {
     const { url } = await req.json();
@@ -74,11 +96,12 @@ export async function POST(req: NextRequest) {
     }
 
     // Step 1: Validate API key before making any network requests
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({
-        error: 'OPENAI_API_KEY is not configured. Add it to your environment variables to enable AI-powered auto-fill.',
-      }, { status: 400 });
+      return NextResponse.json(
+        { error: 'GEMINI_API_KEY is not configured in .env' },
+        { status: 400 }
+      );
     }
 
     // Step 2: Fetch the page HTML
@@ -108,7 +131,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Truncate to keep within token limits
+    // Clean HTML and extract candidate images
     const pageText = stripHtml(html).slice(0, 8000);
     const imageUrls = extractImageUrls(html).slice(0, 5);
 
@@ -119,28 +142,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Step 3: Use OpenAI to extract structured data
+    // Step 3: Initialize Google Gen AI client
+    const ai = new GoogleGenAI({ apiKey });
+
     const systemPrompt = `You are an expert FPV drone parts analyst. You receive raw text scraped from an FPV product page and must extract structured product information.
 
-Return ONLY a JSON object with this exact shape:
-{
-  "name": "product name (string)",
-  "brand": "manufacturer/brand name (string, empty if unknown)",
-  "category": "one of: flight_controller, esc, motor, frame, vtx, camera, receiver, battery, propeller",
-  "mounting_pattern": "e.g. 30.5x30.5mm or 20x20mm (string, empty if N/A)",
-  "voltage_range": "e.g. 4S-6S or 3-6S (string, empty if N/A)",
-  "continuous_current": "max current in amps as a number, null if N/A",
-  "mcu": "MCU chip e.g. F405, F722 (string, empty if N/A)",
-  "weight_g": "weight in grams as a number, null if unknown",
-  "image_url": "best product image URL from the provided list, empty string if none",
-  "buy_price": "listed price in USD as a number, null if not found"
-}
-
 Rules:
-- Infer the category from the product name and specs. If unclear, pick the closest match.
+- Infer the category from the product name and specs. If unclear, pick the closest match from the enum.
 - Extract the price from the page text — look for $XX.XX patterns.
-- Only include the image_url if it looks like a real product image from the provided list.
-- Return empty strings (not null) for text fields when unknown. Use null only for numeric fields.`;
+- Only include an image_url if it looks like a real product image from the provided candidate list.
+- Set string fields to null when the information is not available on the page.
+- Set numeric fields to null when the information is not available on the page.`;
 
     const userPrompt = `Product page URL: ${parsedUrl.hostname}${parsedUrl.pathname}
 
@@ -150,44 +162,32 @@ ${pageText}
 Candidate image URLs:
 ${imageUrls.length > 0 ? imageUrls.join('\n') : 'No images found'}`;
 
-    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        temperature: 0.3,
-        max_tokens: 600,
-        response_format: { type: 'json_object' },
-      }),
-    });
-
-    if (!aiRes.ok) {
-      const errText = await aiRes.text();
-      return NextResponse.json(
-        { error: `AI parsing failed (${aiRes.status}). ${errText.slice(0, 150)}` },
-        { status: 500 }
-      );
-    }
-
-    const aiData = await aiRes.json();
-    const content = aiData.choices?.[0]?.message?.content;
-
-    if (!content) {
-      return NextResponse.json({ error: 'AI returned no content' }, { status: 500 });
-    }
-
+    // Step 4: Call gemini-2.5-flash with structured JSON output
     let extracted: ScrapedPart;
     try {
-      extracted = JSON.parse(content);
-    } catch {
-      return NextResponse.json({ error: 'AI returned invalid JSON' }, { status: 500 });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: 'application/json',
+          responseSchema,
+          temperature: 0.3,
+        },
+      });
+
+      const text = response.text;
+      if (!text) {
+        return NextResponse.json({ error: 'Gemini returned no content' }, { status: 500 });
+      }
+
+      extracted = JSON.parse(text) as ScrapedPart;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gemini API error';
+      return NextResponse.json(
+        { error: `Gemini parsing failed: ${msg}` },
+        { status: 500 }
+      );
     }
 
     // Normalize category
@@ -198,12 +198,8 @@ ${imageUrls.length > 0 ? imageUrls.join('\n') : 'No images found'}`;
     }
 
     // Infer vendor name from hostname
-    const vendorName = parsedUrl.hostname
-      .replace(/^www\./, '')
-      .replace(/\.(com|net|org|io|co|store|shop)$/, '')
-      .replace(/^([a-z0-9]+)\./, '$1')
-      .split('.')[0]
-      .charAt(0).toUpperCase() + parsedUrl.hostname.replace(/^www\./, '').split('.')[0].slice(1);
+    const hostPart = parsedUrl.hostname.replace(/^www\./, '').split('.')[0];
+    const vendorName = hostPart.charAt(0).toUpperCase() + hostPart.slice(1);
 
     return NextResponse.json({
       ...extracted,
