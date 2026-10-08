@@ -6,6 +6,7 @@ import {
   Check, X, Loader2, Save, ArrowLeft, Store, Package,
   BadgeCheck, AlertCircle, RefreshCw, Plus, Edit3, ExternalLink,
   Search, Boxes, ClipboardList, Zap, Truck, AlertTriangle,
+  Wand2, Globe,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -98,6 +99,11 @@ export default function AdminDashboard() {
     vendorName: '', supplierUrl: '', buyPrice: '', sellPrice: '', inStock: true,
   });
   const [submitting, setSubmitting] = useState(false);
+
+  // Scrape state
+  const [scrapeUrl, setScrapeUrl] = useState('');
+  const [scraping, setScraping] = useState(false);
+  const [scrapeError, setScrapeError] = useState<string | null>(null);
 
   // Inventory state
   const [parts, setParts] = useState<InventoryPart[]>([]);
@@ -196,6 +202,46 @@ export default function AdminDashboard() {
       // ignore
     } finally {
       setUpdatingBuilderId(null);
+    }
+  };
+
+  const handleScrape = async () => {
+    if (!scrapeUrl) return;
+    setScraping(true);
+    setScrapeError(null);
+    try {
+      const res = await fetch('/api/admin/scrape-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: scrapeUrl }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setForm((prev) => ({
+          ...prev,
+          name: data.name || prev.name,
+          brand: data.brand || prev.brand,
+          category: data.category || prev.category,
+          imageUrl: data.image_url || prev.imageUrl,
+          mountingPattern: data.mounting_pattern || prev.mountingPattern,
+          voltageRange: data.voltage_range || prev.voltageRange,
+          maxCurrent: data.continuous_current != null ? String(data.continuous_current) : prev.maxCurrent,
+          mcu: data.mcu || prev.mcu,
+          weightG: data.weight_g != null ? String(data.weight_g) : prev.weightG,
+          buyPrice: data.buy_price != null ? String(data.buy_price) : prev.buyPrice,
+          vendorName: data.vendor_name || prev.vendorName,
+          supplierUrl: data.supplier_url || scrapeUrl,
+        }));
+        toast.success('Auto-filled from supplier page — review and adjust before saving');
+      } else {
+        setScrapeError(data.error || 'Failed to scrape page');
+        toast.error(data.error || 'Failed to scrape page');
+      }
+    } catch {
+      setScrapeError('Network error while scraping');
+      toast.error('Network error while scraping');
+    } finally {
+      setScraping(false);
     }
   };
 
@@ -373,7 +419,62 @@ export default function AdminDashboard() {
 
         {/* === TAB 1: Add New Part === */}
         {activeTab === 'add-part' && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="space-y-6">
+            {/* URL Auto-Fill & Scrape */}
+            <div className="bg-gradient-to-br from-cyan-500/10 to-blue-500/5 rounded-2xl border border-cyan-500/20 p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <Wand2 className="w-4 h-4 text-cyan-400" />
+                <h3 className="text-sm font-semibold text-white">URL Auto-Fill & Scrape</h3>
+                <span className="text-[10px] text-slate-500 bg-slate-800/50 px-2 py-0.5 rounded-full">AI-powered</span>
+              </div>
+              <p className="text-xs text-slate-500 mb-3">
+                Paste a supplier product page URL and let AI extract the part name, specs, price, and image automatically.
+              </p>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <Globe className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                  <input
+                    type="text"
+                    value={scrapeUrl}
+                    onChange={(e) => setScrapeUrl(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && scrapeUrl && !scraping) handleScrape(); }}
+                    placeholder="https://getfpv.com/speedybee-f405-v3-flight-controller.html"
+                    className="w-full pl-10 pr-3 py-2.5 rounded-lg bg-slate-900/80 border border-slate-700/50 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/20 transition-colors"
+                  />
+                </div>
+                <button
+                  onClick={handleScrape}
+                  disabled={scraping || !scrapeUrl}
+                  className={cn(
+                    'flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium text-sm whitespace-nowrap transition-all',
+                    scraping || !scrapeUrl
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-gradient-to-r from-cyan-500 to-blue-500 text-white hover:from-cyan-400 hover:to-blue-400 shadow-lg shadow-cyan-500/20'
+                  )}
+                >
+                  {scraping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+                  {scraping ? 'Scraping...' : 'Auto-Fill from URL'}
+                </button>
+              </div>
+              {scraping && (
+                <div className="flex items-center gap-2 mt-3 text-xs text-cyan-400">
+                  <div className="flex gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" style={{ animationDelay: '150ms' }} />
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" style={{ animationDelay: '300ms' }} />
+                  </div>
+                  Fetching page and extracting product data with AI...
+                </div>
+              )}
+              {scrapeError && !scraping && (
+                <div className="flex items-center gap-2 mt-3 text-xs text-red-400">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  {scrapeError}
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* Core Part Information */}
             <div className="lg:col-span-2 space-y-6">
               <FormCard title="Core Part Information" icon={Package} accent="cyan">
@@ -625,6 +726,7 @@ export default function AdminDashboard() {
                 Add Part & Create Vendor Listing
               </button>
             </div>
+          </div>
           </div>
         )}
 
