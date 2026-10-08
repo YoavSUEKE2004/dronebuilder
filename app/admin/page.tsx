@@ -6,7 +6,7 @@ import {
   Check, X, Loader2, Save, ArrowLeft, Store, Package,
   BadgeCheck, AlertCircle, RefreshCw, Plus, Edit3, ExternalLink,
   Search, Boxes, ClipboardList, Zap, Truck, AlertTriangle,
-  Wand2, Globe,
+  Wand2, Globe, FileText,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -104,6 +104,11 @@ export default function AdminDashboard() {
   const [scrapeUrl, setScrapeUrl] = useState('');
   const [scraping, setScraping] = useState(false);
   const [scrapeError, setScrapeError] = useState<string | null>(null);
+
+  // Paste text state
+  const [rawText, setRawText] = useState('');
+  const [parsing, setParsing] = useState(false);
+  const [parseError, setParseError] = useState<string | null>(null);
 
   // Inventory state
   const [parts, setParts] = useState<InventoryPart[]>([]);
@@ -242,6 +247,46 @@ export default function AdminDashboard() {
       toast.error('Network error while scraping');
     } finally {
       setScraping(false);
+    }
+  };
+
+  const handleParseText = async () => {
+    if (!rawText.trim()) {
+      setParseError('Please paste some product page text first.');
+      return;
+    }
+    setParsing(true);
+    setParseError(null);
+    try {
+      const res = await fetch('/api/admin/parse-text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawText }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setForm((prev) => ({
+          ...prev,
+          name: data.name || prev.name,
+          brand: data.brand || prev.brand,
+          category: data.category || prev.category,
+          mountingPattern: data.mounting_pattern || prev.mountingPattern,
+          voltageRange: data.voltage_range || prev.voltageRange,
+          maxCurrent: data.continuous_current != null ? String(data.continuous_current) : prev.maxCurrent,
+          mcu: data.mcu || prev.mcu,
+          weightG: data.weight_g != null ? String(data.weight_g) : prev.weightG,
+          buyPrice: data.buy_price != null ? String(data.buy_price) : prev.buyPrice,
+        }));
+        toast.success('Specs extracted from pasted text — review and adjust before saving');
+      } else {
+        setParseError(data.error || 'Failed to parse text');
+        toast.error(data.error || 'Failed to parse text');
+      }
+    } catch {
+      setParseError('Network error while parsing text');
+      toast.error('Network error while parsing text');
+    } finally {
+      setParsing(false);
     }
   };
 
@@ -470,6 +515,56 @@ export default function AdminDashboard() {
                 <div className="flex items-center gap-2 mt-3 text-xs text-red-400">
                   <AlertTriangle className="w-3.5 h-3.5" />
                   {scrapeError}
+                </div>
+              )}
+            </div>
+
+            {/* Paste Raw Page Text */}
+            <div className="bg-gradient-to-br from-blue-500/10 to-cyan-500/5 rounded-2xl border border-blue-500/20 p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <FileText className="w-4 h-4 text-blue-400" />
+                <h3 className="text-sm font-semibold text-white">Paste Raw Page Text</h3>
+                <span className="text-[10px] text-slate-500 bg-slate-800/50 px-2 py-0.5 rounded-full">Gemini AI</span>
+              </div>
+              <p className="text-xs text-slate-500 mb-3">
+                Copy any product page text from AliExpress, GetFPV, or Banggood and paste it here. Gemini will extract the specs automatically.
+              </p>
+              <textarea
+                value={rawText}
+                onChange={(e) => setRawText(e.target.value)}
+                placeholder="Paste unformatted text from AliExpress, GetFPV, or Banggood here..."
+                rows={5}
+                className="w-full px-3 py-2.5 rounded-lg bg-slate-900/80 border border-slate-700/50 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 transition-colors resize-y font-mono"
+              />
+              <div className="flex justify-end mt-3">
+                <button
+                  onClick={handleParseText}
+                  disabled={parsing || !rawText.trim()}
+                  className={cn(
+                    'flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium text-sm whitespace-nowrap transition-all',
+                    parsing || !rawText.trim()
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-gradient-to-r from-blue-500 to-cyan-500 text-white hover:from-blue-400 hover:to-cyan-400 shadow-lg shadow-blue-500/20'
+                  )}
+                >
+                  {parsing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+                  {parsing ? 'Parsing...' : 'Extract Specs with Gemini AI'}
+                </button>
+              </div>
+              {parsing && (
+                <div className="flex items-center gap-2 mt-3 text-xs text-blue-400">
+                  <div className="flex gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '150ms' }} />
+                    <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" style={{ animationDelay: '300ms' }} />
+                  </div>
+                  Extracting product specs with Gemini AI...
+                </div>
+              )}
+              {parseError && !parsing && (
+                <div className="flex items-center gap-2 mt-3 text-xs text-red-400">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  {parseError}
                 </div>
               )}
             </div>
