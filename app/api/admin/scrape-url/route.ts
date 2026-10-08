@@ -73,7 +73,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid URL format' }, { status: 400 });
     }
 
-    // Step 1: Fetch the page HTML
+    // Step 1: Validate API key before making any network requests
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({
+        error: 'OPENAI_API_KEY is not configured. Add it to your environment variables to enable AI-powered auto-fill.',
+      }, { status: 400 });
+    }
+
+    // Step 2: Fetch the page HTML
     let html: string;
     try {
       const fetchRes = await fetch(parsedUrl.toString(), {
@@ -111,14 +119,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Step 2: Use OpenAI to extract structured data
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({
-        error: 'OPENAI_API_KEY is not configured. Add it to enable AI-powered auto-fill.',
-      }, { status: 400 });
-    }
-
+    // Step 3: Use OpenAI to extract structured data
     const systemPrompt = `You are an expert FPV drone parts analyst. You receive raw text scraped from an FPV product page and must extract structured product information.
 
 Return ONLY a JSON object with this exact shape:
