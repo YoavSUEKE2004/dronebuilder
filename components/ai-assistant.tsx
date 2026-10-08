@@ -173,32 +173,71 @@ function generateBuild(components: ComponentWithSpecs[], parse: ParseResult): Se
 export default function AIAssistant({ components, onBuildGenerated }: Props) {
   const [prompt, setPrompt] = useState('');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ summary: string; parts: SelectedParts } | null>(null);
+  const [result, setResult] = useState<{ summary: string; parts: SelectedParts; reasoning?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
 
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
     setLoading(true);
     setError(null);
     try {
-      await new Promise((r) => setTimeout(r, 800));
-      const parse = parsePrompt(prompt);
-      const parts = generateBuild(components, parse);
+      // Try OpenAI-powered advisor first
+      const compSummaries = components.map((c) => ({
+        id: c.id,
+        name: c.name,
+        category: c.category,
+        price: Number(c.price),
+        quality_score: c.quality_score,
+        electrical_specs: c.electrical_specs ? {
+          max_voltage_s: c.electrical_specs.max_voltage_s,
+          max_current_a: c.electrical_specs.max_current_a,
+          protocol: c.electrical_specs.protocol,
+        } : null,
+        mounting_pattern: c.mounting_pattern,
+        weight_g: Number(c.weight_g),
+      }));
 
-      const total = Object.values(parts).filter(Boolean).reduce((sum, id) => {
-        const comp = components.find((c) => c.id === id);
-        return sum + (comp ? Number(comp.price) : 0);
-      }, 0);
+      let aiResult: { parts: SelectedParts; summary: string; reasoning?: string } | null = null;
 
-      const summaryParts: string[] = [];
-      if (parse.sizeInches) summaryParts.push(`${parse.sizeInches}"`);
-      if (parse.batteryS) summaryParts.push(`${parse.batteryS}S`);
-      if (parse.useCase) summaryParts.push(parse.useCase);
-      summaryParts.push(`$${total.toFixed(2)}`);
+      try {
+        const res = await fetch('/api/ai-advisor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt, components: compSummaries }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.parts && Object.keys(data.parts).length > 0) {
+            aiResult = { parts: data.parts, summary: data.summary || 'AI-generated build', reasoning: data.reasoning };
+          }
+        }
+      } catch {
+        // Fall through to local generation
+      }
 
-      setResult({ summary: summaryParts.join(' · '), parts });
-      onBuildGenerated(parts);
+      if (!aiResult) {
+        // Fallback to local rule-based generation
+        await new Promise((r) => setTimeout(r, 600));
+        const parse = parsePrompt(prompt);
+        const parts = generateBuild(components, parse);
+
+        const total = Object.values(parts).filter(Boolean).reduce((sum, id) => {
+          const comp = components.find((c) => c.id === id);
+          return sum + (comp ? Number(comp.price) : 0);
+        }, 0);
+
+        const summaryParts: string[] = [];
+        if (parse.sizeInches) summaryParts.push(`${parse.sizeInches}"`);
+        if (parse.batteryS) summaryParts.push(`${parse.batteryS}S`);
+        if (parse.useCase) summaryParts.push(parse.useCase);
+        summaryParts.push(`${total.toFixed(2)}`);
+
+        aiResult = { parts, summary: summaryParts.join(' · ') };
+      }
+
+      setResult(aiResult);
+      onBuildGenerated(aiResult.parts);
     } catch (err) {
       setError('Could not generate a build. Try rephrasing your request.');
     } finally {
@@ -265,18 +304,22 @@ export default function AIAssistant({ components, onBuildGenerated }: Props) {
             )}
 
             {result && (
-              <div className="flex items-center gap-2 p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
-                <Check className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-[10px] font-medium text-cyan-300">Build generated: {result.summary}</p>
-                  <p className="text-[9px] text-slate-500">All parts selected and 3D model updated</p>
+              <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
+                <div className="flex items-center gap-2">
+                  <Check className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[10px] font-medium text-cyan-300">Build generated: {result.summary}</p>
+                    {result.reasoning && (
+                      <p className="text-[9px] text-slate-400 mt-0.5 italic">{result.reasoning}</p>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => setResult(null)}
+                    className="text-slate-500 hover:text-slate-300"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
                 </div>
-                <button
-                  onClick={() => setResult(null)}
-                  className="text-slate-500 hover:text-slate-300"
-                >
-                  <X className="w-3 h-3" />
-                </button>
               </div>
             )}
           </div>
