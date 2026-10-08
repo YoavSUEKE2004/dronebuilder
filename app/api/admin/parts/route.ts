@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const {
       name, brand, category, imageUrl,
-      mountingPattern, voltageRange, maxCurrent, weightG, videoStandard,
+      mountingPattern, voltageRange, maxCurrent, mcu, weightG, videoStandard,
       vendorName, supplierUrl, buyPrice, sellPrice, inStock,
     } = body;
 
@@ -35,6 +35,7 @@ export async function POST(req: NextRequest) {
         voltage_range: voltageRange || '',
         max_current: maxCurrent || null,
         weight_g: weightG || 0,
+        mcu: mcu || '',
         video_system: videoStandard || null,
         spec_verified: true,
         quality_score: 5,

@@ -94,7 +94,7 @@ export default function AdminDashboard() {
   // Add-part form state
   const [form, setForm] = useState({
     name: '', brand: '', category: 'flight_controller', imageUrl: '',
-    mountingPattern: '', voltageRange: '', maxCurrent: '', weightG: '', videoStandard: '',
+    mountingPattern: '', voltageRange: '', maxCurrent: '', mcu: '', weightG: '', videoStandard: '',
     vendorName: '', supplierUrl: '', buyPrice: '', sellPrice: '', inStock: true,
   });
   const [submitting, setSubmitting] = useState(false);
@@ -217,6 +217,7 @@ export default function AdminDashboard() {
           mountingPattern: form.mountingPattern,
           voltageRange: form.voltageRange,
           maxCurrent: form.maxCurrent ? parseFloat(form.maxCurrent) : null,
+          mcu: form.mcu || null,
           weightG: form.weightG ? parseFloat(form.weightG) : 0,
           videoStandard: form.videoStandard || null,
           vendorName: form.vendorName,
@@ -231,7 +232,7 @@ export default function AdminDashboard() {
         toast.success(`"${form.name}" added to catalog with ${form.vendorName} listing`);
         setForm({
           name: '', brand: '', category: 'flight_controller', imageUrl: '',
-          mountingPattern: '', voltageRange: '', maxCurrent: '', weightG: '', videoStandard: '',
+          mountingPattern: '', voltageRange: '', maxCurrent: '', mcu: '', weightG: '', videoStandard: '',
           vendorName: '', supplierUrl: '', buyPrice: '', sellPrice: '', inStock: true,
         });
         // Switch to inventory tab to show the new part
@@ -467,6 +468,15 @@ export default function AdminDashboard() {
                         value={form.weightG}
                         onChange={(e) => setForm({ ...form, weightG: e.target.value })}
                         placeholder="8.5"
+                        className={inputClass}
+                      />
+                    </Field>
+                    <Field label="MCU" hint="e.g. F405, F722, AT32F435">
+                      <input
+                        type="text"
+                        value={form.mcu}
+                        onChange={(e) => setForm({ ...form, mcu: e.target.value })}
+                        placeholder="F405"
                         className={inputClass}
                       />
                     </Field>

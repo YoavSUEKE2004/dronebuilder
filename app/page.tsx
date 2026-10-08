@@ -150,6 +150,14 @@ export default function ConfiguratorPage() {
               <span className="text-xs text-slate-500">{selectedCount}/9 selected</span>
             )}
           </div>
+          <a
+            href="/admin"
+            className="flex items-center gap-2 text-sm text-slate-400 hover:text-cyan-400 px-3 py-2 rounded-lg hover:bg-slate-800/60 transition-colors"
+            title="Admin Portal"
+          >
+            <Settings className="w-4 h-4" />
+            <span className="hidden sm:inline">Admin</span>
+          </a>
           <button
             onClick={() => setCheckoutOpen(true)}
             disabled={selectedCount === 0}
