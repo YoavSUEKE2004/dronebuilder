@@ -21,44 +21,6 @@ const VALID_CATEGORIES = [
   'vtx', 'camera', 'receiver', 'battery', 'propeller',
 ];
 
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<nav[\s\S]*?<\/nav>/gi, '')
-    .replace(/<footer[\s\S]*?<\/footer>/gi, '')
-    .replace(/<header[\s\S]*?<\/header>/gi, '')
-    .replace(/<svg[\s\S]*?<\/svg>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function extractImageUrls(html: string): string[] {
-  const urls: string[] = [];
-  const imgRegex = /<img[^>]+src=["']([^"']+)["']/gi;
-  let match;
-  while ((match = imgRegex.exec(html)) !== null) {
-    const src = match[1];
-    if (src && !src.startsWith('data:') && !src.includes('logo') && !src.includes('icon') && !src.includes('placeholder')) {
-      if (src.startsWith('//')) {
-        urls.push('https:' + src);
-      } else if (src.startsWith('/')) {
-        // can't resolve relative without origin — skip
-      } else {
-        urls.push(src);
-      }
-    }
-  }
-  return urls;
-}
-
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
@@ -79,6 +41,19 @@ const responseSchema = {
   },
   required: ['name', 'brand', 'category', 'image_url'],
 };
+
+function extractImageUrls(text: string): string[] {
+  const urls: string[] = [];
+  const urlRegex = /(?:!\[.*?\]\((https?:\/\/[^\s)]+)\)|"(https?:\/\/[^"]+\.(?:jpg|jpeg|png|webp|gif)[^"]*)")/gi;
+  let match;
+  while ((match = urlRegex.exec(text)) !== null) {
+    const src = match[1] || match[2];
+    if (src && !src.includes('logo') && !src.includes('icon') && !src.includes('placeholder') && !urls.includes(src)) {
+      urls.push(src);
+    }
+  }
+  return urls.slice(0, 8);
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -104,60 +79,62 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Step 2: Fetch the page HTML
-    let html: string;
+    // Step 2: Fetch the page via Jina AI Reader to bypass anti-bot protection
+    const jinaUrl = `https://r.jina.ai/${parsedUrl.toString()}`;
+    let pageContent: string;
     try {
-      const fetchRes = await fetch(parsedUrl.toString(), {
+      const jinaRes = await fetch(jinaUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/plain',
+          'X-Target-Selector': 'body',
         },
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(30000),
       });
 
-      if (!fetchRes.ok) {
+      if (!jinaRes.ok) {
         return NextResponse.json(
-          { error: `Failed to fetch page (HTTP ${fetchRes.status})` },
+          { error: `Jina Reader failed to fetch the page (HTTP ${jinaRes.status}). The supplier site may be down or blocking requests.` },
           { status: 502 }
         );
       }
 
-      html = await fetchRes.text();
+      pageContent = await jinaRes.text();
     } catch {
       return NextResponse.json(
-        { error: 'Could not reach the supplier URL. The site may be blocking automated requests.' },
+        { error: 'Could not reach the supplier URL via Jina Reader. The site may be temporarily unavailable.' },
         { status: 502 }
       );
     }
 
-    // Clean HTML and extract candidate images
-    const pageText = stripHtml(html).slice(0, 8000);
-    const imageUrls = extractImageUrls(html).slice(0, 5);
-
-    if (pageText.length < 50) {
+    if (pageContent.length < 50) {
       return NextResponse.json(
         { error: 'Page content was empty or could not be parsed.' },
         { status: 422 }
       );
     }
 
+    // Extract candidate image URLs from Jina's output
+    const imageUrls = extractImageUrls(pageContent);
+
+    // Truncate for token limits
+    const truncatedContent = pageContent.slice(0, 10000);
+
     // Step 3: Initialize Google Gen AI client
     const ai = new GoogleGenAI({ apiKey });
 
-    const systemPrompt = `You are an expert FPV drone parts analyst. You receive raw text scraped from an FPV product page and must extract structured product information.
+    const systemPrompt = `You are an expert FPV drone parts analyst. You receive text scraped from an FPV product page (via Jina AI Reader) and must extract structured product information.
 
 Rules:
 - Infer the category from the product name and specs. If unclear, pick the closest match from the enum.
-- Extract the price from the page text — look for $XX.XX patterns.
+- Extract the price from the page text — look for $XX.XX patterns or listed prices.
 - Only include an image_url if it looks like a real product image from the provided candidate list.
 - Set string fields to null when the information is not available on the page.
 - Set numeric fields to null when the information is not available on the page.`;
 
     const userPrompt = `Product page URL: ${parsedUrl.hostname}${parsedUrl.pathname}
 
-Page text (truncated):
-${pageText}
+Page content (truncated):
+${truncatedContent}
 
 Candidate image URLs:
 ${imageUrls.length > 0 ? imageUrls.join('\n') : 'No images found'}`;
